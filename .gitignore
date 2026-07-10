@@ -1,0 +1,26 @@
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# Project specific ignores
+ข้อมูลทาง/
+Data_layout/
+# Do not commit generated caches
+cache/
+*.json
+
+# Ignore excel outputs and other large files
+*.xlsx
+# But keep Excel_Templates
+!Excel_Templates/
+!Excel_Templates/*.xlsx
+
+# Ignore scratch files unless explicitly added
+scratch/

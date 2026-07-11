@@ -10,6 +10,7 @@ class GISEngine:
     def __init__(self, shp_dir):
         self.shp_dir = shp_dir
         self.road_gdf = None
+        self.crossed_provinces = []
         
     def safe_decode(self, val):
         if not isinstance(val, str):
@@ -87,6 +88,93 @@ class GISEngine:
         self.road_gdf = gdf.to_crs(TARGET_CRS)
         return self.road_gdf
 
+    def _fetch_rest_api_as_gdf(self, url, bounds_utm):
+        """Fetch features from ESRI MapServer REST API within a bounding box"""
+        import urllib.request
+        import urllib.parse
+        import json
+        import ssl
+        from shapely.geometry import shape
+
+        # Create bounding box in UTM and reproject to WGS84 for the API
+        from shapely.geometry import box
+        bbox_poly = box(*bounds_utm)
+        bbox_gdf = gpd.GeoDataFrame({'geometry': [bbox_poly]}, crs=self.road_gdf.crs)
+        bbox_wgs84 = bbox_gdf.to_crs(epsg=4326).total_bounds
+
+        geometry_json = {
+            "xmin": bbox_wgs84[0],
+            "ymin": bbox_wgs84[1],
+            "xmax": bbox_wgs84[2],
+            "ymax": bbox_wgs84[3],
+            "spatialReference": {"wkid": 4326}
+        }
+        
+        # Determine layer id from url if possible or assume 0
+        layer_id = url.split('/')[-1]
+        if not layer_id.isdigit():
+            layer_id = "0"
+            query_url = f"{url}/{layer_id}/query"
+        else:
+            query_url = f"{url}/query"
+
+        params = {
+            'f': 'json',
+            'geometry': json.dumps(geometry_json),
+            'geometryType': 'esriGeometryEnvelope',
+            'spatialRel': 'esriSpatialRelIntersects',
+            'outFields': '*',
+            'returnGeometry': 'true',
+            'outSR': '4326'
+        }
+        
+        data = urllib.parse.urlencode(params).encode('utf-8')
+        req = urllib.request.Request(query_url, data=data, headers={'User-Agent': 'Mozilla/5.0'})
+        
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+
+        try:
+            with urllib.request.urlopen(req, context=ctx, timeout=30) as response:
+                resp_json = json.loads(response.read().decode())
+                
+                features = resp_json.get('features', [])
+                if not features:
+                    return gpd.GeoDataFrame()
+                
+                # Convert ESRI features to Shapely geometries
+                geoms = []
+                attrs_list = []
+                for f in features:
+                    geom = f.get('geometry')
+                    if not geom:
+                        continue
+                    # Simple conversion for ESRI polygon to GeoJSON-like
+                    if 'rings' in geom:
+                        poly_geojson = {'type': 'Polygon', 'coordinates': geom['rings']}
+                        geoms.append(shape(poly_geojson))
+                    elif 'paths' in geom:
+                        line_geojson = {'type': 'MultiLineString', 'coordinates': geom['paths']}
+                        geoms.append(shape(line_geojson))
+                    elif 'x' in geom and 'y' in geom:
+                        pt_geojson = {'type': 'Point', 'coordinates': [geom['x'], geom['y']]}
+                        geoms.append(shape(pt_geojson))
+                    else:
+                        continue
+                        
+                    attrs = f.get('attributes', {})
+                    attrs_list.append(attrs)
+                
+                if not geoms:
+                    return gpd.GeoDataFrame()
+                    
+                gdf = gpd.GeoDataFrame(attrs_list, geometry=geoms, crs="EPSG:4326")
+                return gdf.to_crs(self.road_gdf.crs)
+        except Exception as e:
+            print(f"Error fetching from REST API {url}: {e}")
+            return gpd.GeoDataFrame()
+
     def calculate_intersections(self, polygon_shp_path, name_col, buffer_m):
         import time
         start_time = time.time()
@@ -145,25 +233,45 @@ class GISEngine:
 
         read_bbox = bbox_in_shp_crs if bbox_in_shp_crs else bounds
 
+        is_api = isinstance(polygon_shp_path, str) and polygon_shp_path.startswith('http')
+
         # โหลด Polygon และแปลงพิกัด (ใช้ bbox ที่แปลง CRS แล้วช่วยกรองข้อมูล)
-        print(f"[{time.strftime('%X')}] Reading polygon shapefile...", flush=True)
-        poly_gdf = self._load_poly_gdf(polygon_shp_path, read_bbox)
-        if poly_gdf.empty:
-            return pd.DataFrame()
+        if is_api:
+            print(f"[{time.strftime('%X')}] Reading polygon from REST API...", flush=True)
+            poly_gdf = self._fetch_rest_api_as_gdf(polygon_shp_path, bounds)
+        else:
+            print(f"[{time.strftime('%X')}] Reading polygon shapefile...", flush=True)
+            poly_gdf = self._load_poly_gdf(polygon_shp_path, read_bbox)
             
-        print(f"[{time.strftime('%X')}] Converting CRS to {TARGET_CRS}...", flush=True)
-        poly_gdf = poly_gdf.to_crs(TARGET_CRS)
+        if poly_gdf.empty:
+            is_fallback = False
+            path_str = str(polygon_shp_path)
+            if any(x in path_str for x in ['สถานศึกษา', 'วัด', 'โรงพยาบาล', 'รพสต']):
+                is_fallback = True
+            
+            if not is_fallback or is_api:
+                return pd.DataFrame()
+            else:
+                print(f"[{time.strftime('%X')}] ไม่มีข้อมูลใน Bounding Box ทำการโหลดทั้งจังหวัดเพื่อหาจุดที่ใกล้ที่สุด...", flush=True)
+                poly_gdf = self._load_poly_gdf(polygon_shp_path, None)
+                if poly_gdf.empty:
+                    return pd.DataFrame()
+            
+        if not is_api:
+            print(f"[{time.strftime('%X')}] Converting CRS to {TARGET_CRS}...", flush=True)
+            poly_gdf = poly_gdf.to_crs(TARGET_CRS)
         
         # หั่น (Clip) geometry ของ Polygon ให้เหลือเฉพาะขอบเขตพื้นที่ศึกษา เพื่อเร่งความเร็วการคำนวณ 150 เท่า!
-        xmin, ymin, xmax, ymax = bounds
-        try:
-            import shapely
-            poly_gdf['geometry'] = poly_gdf.geometry.apply(
-                lambda g: shapely.clip_by_rect(g, xmin, ymin, xmax, ymax) if g and not g.is_empty else g
-            )
-            poly_gdf = poly_gdf[~poly_gdf.geometry.is_empty]
-        except Exception as e:
-            print(f"[{time.strftime('%X')}] Warning clipping geometries: {e}", flush=True)
+        if not locals().get('is_fallback', False):
+            xmin, ymin, xmax, ymax = bounds
+            try:
+                import shapely
+                poly_gdf['geometry'] = poly_gdf.geometry.apply(
+                    lambda g: shapely.clip_by_rect(g, xmin, ymin, xmax, ymax) if g and not g.is_empty else g
+                )
+                poly_gdf = poly_gdf[~poly_gdf.geometry.is_empty]
+            except Exception as e:
+                print(f"[{time.strftime('%X')}] Warning clipping geometries: {e}", flush=True)
             
         print(f"[{time.strftime('%X')}] Total polygons loaded: {len(poly_gdf)}", flush=True)
         
@@ -231,7 +339,7 @@ class GISEngine:
                 continue
                 
             # กรอง polygon ที่ว่างออกก่อน
-            valid_polys = poly_gdf[~poly_gdf.is_empty]
+            valid_polys = poly_gdf[~poly_gdf.geometry.is_empty]
             try:
                 intersecting_polys = valid_polys[valid_polys.intersects(road_buf_geom)]
             except Exception:
@@ -252,7 +360,12 @@ class GISEngine:
                     else:
                         poly_name = f"{poly_name} Zone None"
                 poly_geom = poly.geometry
-                
+                if not poly_geom.is_valid:
+                    try:
+                        poly_geom = poly_geom.buffer(0)
+                    except:
+                        pass
+
                 # ถ้าลักษณะภูมิศาสตร์เป็นจุด (เช่น ตำแหน่งหมู่บ้าน, แหล่งโบราณสถาน)
                 if poly_geom.geom_type in ['Point', 'MultiPoint']:
                     from shapely.geometry import Point
@@ -412,6 +525,43 @@ class GISEngine:
                                 print(f"  -> ดึงหมู่บ้าน {poly_name} (อ.{nearest_village.get('AMPHOE_TH','')} จ.{nearest_village.get('PROV_TH','')}) มาชดเชยให้ ต.{tb}")
                 except Exception as e:
                     print(f"  [Warning] เกิดข้อผิดพลาดในการตรวจสอบหมู่บ้านตามขอบเขตตำบล: {e}")
+
+        # --- Fallback: หากไม่พบจุดตัดในรัศมี 500ม. ให้ดึงจุดที่ใกล้ที่สุด 1 จุด (เฉพาะสถานศึกษา วัด รพ.)
+        if len(results) == 0 and poly_gdf is not None and not poly_gdf.empty:
+            if 'สถานศึกษา' in polygon_shp_path or 'วัด' in polygon_shp_path or 'โรงพยาบาล' in polygon_shp_path or 'รพสต' in polygon_shp_path:
+                print(f"[{time.strftime('%X')}] ไม่พบสถานที่ในระยะตัดผ่าน ทำการดึงสถานที่ที่ใกล้ที่สุด 1 แห่งแทน...", flush=True)
+                
+                # หาจุดที่ใกล้ที่สุดจาก road_buf_union
+                road_union_geom = self.road_gdf.geometry.union_all()
+                distances = poly_gdf.geometry.distance(road_union_geom)
+                nearest_idx = distances.idxmin()
+                nearest_poly = poly_gdf.loc[nearest_idx]
+                
+                poly_name = self.safe_decode(nearest_poly.get(actual_name_col, "Unknown"))
+                poly_geom = nearest_poly.geometry
+                
+                from shapely.geometry import Point
+                pt = poly_geom.geoms[0] if hasattr(poly_geom, 'geoms') else poly_geom
+                if not isinstance(pt, Point):
+                    pt = pt.centroid
+                
+                # หา km อ้างอิงจากเส้นถนน
+                road_line = self.road_gdf.geometry.iloc[0]
+                km_start_base = self.road_gdf.iloc[0].get('km_start', 0)
+                dist_on_line = road_line.project(pt)
+                km = (km_start_base * 1000) + dist_on_line
+                
+                results.append({
+                    'route': self.road_gdf.iloc[0].get('route', 'Unknown'),
+                    'area_name': poly_name + " (อยู่นอกระยะ 500ม.)",
+                    'km_in_m': km,
+                    'km_out_m': km,
+                    'length_m': 0,
+                    'intersect_area_sqm': 0,
+                    'center_x': pt.x,
+                    'center_y': pt.y,
+                    'properties': {k: self.safe_decode(v) if isinstance(v, str) else str(v) for k, v in nearest_poly.items() if k != 'geometry'}
+                })
 
         return pd.DataFrame(results)
 
@@ -599,6 +749,20 @@ class GISEngine:
                 for col in ['TAMBOL_TH', 'AMPHOE_TH', 'PROV_TH']:
                     if col in joined.columns:
                         joined[col] = joined[col].apply(lambda x: self.safe_decode(x) if x and not pd.isna(x) else "")
+                
+                # กรองเฉพาะข้อมูลที่อยู่ใน crossed_provinces (ถ้ามีการระบุไว้)
+                if hasattr(self, 'crossed_provinces') and self.crossed_provinces and 'PROV_TH' in joined.columns:
+                    original_len = len(joined)
+                    def check_prov(p):
+                        if not p: return False
+                        for cp in self.crossed_provinces:
+                            if cp in p or p in cp:
+                                return True
+                        return False
+                    joined = joined[joined['PROV_TH'].apply(check_prov)]
+                    if len(joined) < original_len:
+                        print(f"  [Filter] กรองข้อมูลจุดที่อยู่นอกพื้นที่โครงการออก (เหลือ {len(joined)} จาก {original_len})")
+                        
                 return joined
         except Exception as e:
             print(f"  [Warning] เกิดข้อผิดพลาดในการเชื่อมโยงขอบเขตการปกครอง: {e}")

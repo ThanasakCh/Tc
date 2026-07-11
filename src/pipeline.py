@@ -54,8 +54,8 @@ def run_pipeline():
             txt_clean = re.sub(r'[\.\-_\s]', '', text).upper()
             
             # ถ้าเป็น 84-1 -> 841, แต่โฟลเดอร์เป็น 8401
-            # เราจะเอาตัวอักษรของ kw_clean มาต่อเป็น regex เช่น P.*8.*4.*1
-            pattern = '.*'.join(list(kw_clean))
+            # ป้องกัน PatternError ด้วย re.escape
+            pattern = '.*'.join(re.escape(c) for c in list(kw_clean))
             return re.search(pattern, txt_clean) is not None
 
         if not keywords:
@@ -98,6 +98,91 @@ def run_pipeline():
         # 3. โหลดเส้นกลางถนนและใช้ Fuzzy Match (STEP 1)
         engine.load_road_centerline(project_path)
         
+        # --- [NEW] Export Start and End Points from KM ---
+        try:
+            import geopandas as gpd
+            import pandas as pd
+            from shapely.geometry import Point
+            
+            # Find KM shapefile
+            km_shp = None
+            for f in os.listdir(project_path):
+                if f.upper().endswith("_KM.SHP"):
+                    km_shp = os.path.join(project_path, f)
+                    break
+                    
+            if km_shp and os.path.exists(km_shp):
+                km_gdf = gpd.read_file(km_shp)
+                
+                km_col = None
+                for col in km_gdf.columns:
+                    if col.lower() == 'km':
+                        km_col = col
+                        break
+                        
+                if km_col:
+                    km_gdf['_km_num'] = pd.to_numeric(km_gdf[km_col].astype(str).str.replace('+', ''), errors='coerce')
+                    km_gdf = km_gdf.dropna(subset=['_km_num'])
+                    
+                    if not km_gdf.empty:
+                        min_km_row = km_gdf.loc[km_gdf['_km_num'].idxmin()]
+                        max_km_row = km_gdf.loc[km_gdf['_km_num'].idxmax()]
+                        
+                        pts = []
+                        labels = []
+                        
+                        start_geom = min_km_row.geometry
+                        end_geom = max_km_row.geometry
+                        
+                        if isinstance(start_geom, Point):
+                            pts.append(start_geom)
+                            labels.append(f"Start (KM {min_km_row[km_col]})")
+                        if isinstance(end_geom, Point) and end_geom != start_geom:
+                            pts.append(end_geom)
+                            labels.append(f"End (KM {max_km_row[km_col]})")
+                            
+                        if pts:
+                            pt_gdf = gpd.GeoDataFrame({'PointType': labels}, geometry=pts, crs=km_gdf.crs)
+                            if not engine.road_gdf.empty:
+                                pt_gdf = pt_gdf.to_crs(engine.road_gdf.crs)
+                                
+                            layout_shp_dir = os.path.join(DATA_LAYOUT_DIR, proj_name, "Shp")
+                            os.makedirs(layout_shp_dir, exist_ok=True)
+                            pt_out_path = os.path.join(layout_shp_dir, "Start_End_Point.shp")
+                            pt_gdf.to_file(pt_out_path)
+                            print(f"[{proj_name}] สร้างไฟล์จุดเริ่มต้น-สิ้นสุดแล้ว (จาก KM): Start_End_Point.shp")
+            else:
+                print(f"[{proj_name}] ไม่พบไฟล์ _KM.shp สำหรับสร้างจุดหัวท้าย")
+        except Exception as e:
+            print(f"[{proj_name}] Error generating Start_End_Point: {e}")
+            
+        # --- [NEW] Export Clipped Tambon ---
+        try:
+            import geopandas as gpd
+            admin_path = os.path.join(BASE_DIR, "ข้อมูลShp", "ขอบเขตการปกครอง", "ขอบเขตตำบล.shp")
+            if os.path.exists(admin_path):
+                print(f"[{proj_name}] กำลังตัดแผนที่ขอบเขตตำบล...")
+                admin_gdf = gpd.read_file(admin_path).to_crs(engine.road_gdf.crs)
+                
+                if hasattr(engine.road_gdf.geometry, 'union_all'):
+                    road_union = engine.road_gdf.geometry.buffer(buffer_m).union_all()
+                else:
+                    import shapely.ops
+                    road_union = shapely.ops.unary_union(engine.road_gdf.geometry.buffer(buffer_m))
+                    
+                mask_gdf = gpd.GeoDataFrame(geometry=[road_union], crs=engine.road_gdf.crs)
+                clipped_admin = gpd.overlay(admin_gdf, mask_gdf, how='intersection')
+                
+                if not clipped_admin.empty:
+                    layout_shp_dir = os.path.join(DATA_LAYOUT_DIR, proj_name, "Shp")
+                    os.makedirs(layout_shp_dir, exist_ok=True)
+                    tambon_out_path = os.path.join(layout_shp_dir, "Clipped_Tambon.shp")
+                    clipped_admin.to_file(tambon_out_path)
+                    print(f"[{proj_name}] สร้างไฟล์ขอบเขตตำบล (Clipped) แล้ว: Clipped_Tambon.shp")
+        except Exception as e:
+            print(f"[{proj_name}] Error generating Clipped_Tambon: {e}")
+        # ----------------------------------------
+
         # 3.1 ค้นหาตัวย่อจังหวัดจากชื่อโปรเจกต์
         import re
         province_abbr = ""
@@ -128,24 +213,30 @@ def run_pipeline():
             {"path": os.path.join(BASE_DIR, "ข้อมูลShp", "01_ป่า", "01_ป่าถาวร.shp"), "name_col": "name_th", "do_clip": True, "sheet": {"EAR": "1.ป่า", "EC": "1.ป่า"}},
             {"path": os.path.join(BASE_DIR, "ข้อมูลShp", "Forest Area 2565", "forestarea2565_wgs1984.shp"), "name_col": "f_code", "do_clip": True, "sheet": {"EAR": "4.พื้นที่คงสภาพป่า", "EC": None}},
             {"path": os.path.join(BASE_DIR, "ข้อมูลShp", "Forest Area 2565", "forestarea2565_wgs1984.shp"), "name_col": "f_code", "do_clip": False, "buffer_m_override": 30, "sheet": {"EAR": "4.พื้นที่คงสภาพป่า_เขตทาง", "EC": None}},
-            {"path": os.path.join(BASE_DIR, "ข้อมูลShp", "01_ป่า", "08_ชั้นคุณภาพลุ่มน้ำ_1A1B.shp"), "name_col": "wsc_ver", "do_clip": True, "excel_name": "ชั้นคุณภาพลุ่มน้ำ", "sheet": {"EAR": "10.ชั้นคุณภาพลุ่มน้ำ", "EC": "12.ชั้นคุณภาพลุ่มน้ำ"}},
+            {"path": os.path.join(BASE_DIR, "ข้อมูลShp", "ชั้นคุณภาพลุ่มน้ำ", "WSC_Edit_3112025.shp"), "name_col": "wsc_ver", "do_clip": True, "excel_name": "ชั้นคุณภาพลุ่มน้ำ", "sheet": {"EAR": "10.ชั้นคุณภาพลุ่มน้ำ", "EC": "12.ชั้นคุณภาพลุ่มน้ำ"}},
             {"path": os.path.join(BASE_DIR, "ข้อมูลShp", "แม่น้ำ", "Stream.shp"), "name_col": "HY_LNAME", "do_clip": True, "sheet": {"EAR": "5.จุดตัดแหล่งน้ำ", "EC": "9.จุดตัดแหล่งน้ำ"}},
             {"path": os.path.join(BASE_DIR, "ข้อมูลShp", "หมู่บ้าน", "ตำแหน่งหมู่บ้าน.shp"), "name_col": "VILL_NM_T", "do_clip": True, "excel_name": "บ้าน", "sheet": {"EAR": "2.พื้นที่หมู่บ้าน", "EC": "2.พื้นที่หมู่บ้าน"}},
             {"path": os.path.join(BASE_DIR, "ข้อมูลShp", "04_ตำแหน่งโบราณสถาน", "โบราณสถานประเทศไทย", "historic_site_export.shp"), "name_col": "HISNAME", "do_clip": True, "excel_name": "โบราณสถาน", "sheet": {"EAR": "9.แหล่งโบราณสถาน", "EC": "5.แหล่งโบราณสถาน"}},
         ]
         
-        # เพิ่มพื้นที่อ่อนไหว: EAR ใช้สถานศึกษา+วัด+โรงพยาบาล, EC ใช้ดินถล่ม
-        if is_ear:
+        # เพิ่มพื้นที่อ่อนไหว: EAR ใช้สถานศึกษา+วัด+โรงพยาบาล, EC ใช้สถานศึกษา+ดินถล่ม
+        shapefiles_to_process.append(
+            {"path": os.path.join(BASE_DIR, "ข้อมูลShp", "02_พื้นที่อ่อนไหว", "ตำแหน่งสถานศึกษา_Point.shp"), "name_col": "Name", "do_clip": True, "excel_name": "โรงเรียน", "sheet": {"EAR": "พื้นที่อ่อนไหว_สถานศึกษา", "EC": "3.ตรวจสอบสถานศึกษา"}}
+        )
+        
+        shapefiles_to_process.extend([
+            {"path": os.path.join(BASE_DIR, "ข้อมูลShp", "02_พื้นที่อ่อนไหว", "ตำแหน่งวัด_Point.shp"), "name_col": "Name", "do_clip": True, "excel_name": "วัด", "sheet": {"EAR": "พื้นที่อ่อนไหว_ศาสนสถาน", "EC": "3.ตรวจสอบสถานศึกษา_วัด"}},
+            {"path": os.path.join(BASE_DIR, "ข้อมูลShp", "02_พื้นที่อ่อนไหว", "ตำแหน่งโรงพยาบาล_Point.shp"), "name_col": "Name", "do_clip": True, "excel_name": "รพ", "sheet": {"EAR": "พื้นที่อ่อนไหว_สถานพยาบาล", "EC": "3.ตรวจสอบสถานศึกษา_รพ"}},
+            {"path": os.path.join(BASE_DIR, "ข้อมูลShp", "02_พื้นที่อ่อนไหว", "ตำแหน่งรพสต_Point.shp"), "name_col": "Name", "do_clip": True, "excel_name": "รพสต", "sheet": {"EAR": "พื้นที่อ่อนไหว_สถานพยาบาล", "EC": "3.ตรวจสอบสถานศึกษา_รพสต"}},
+        ])
+
+        if not is_ear:
             shapefiles_to_process.extend([
-                {"path": os.path.join(BASE_DIR, "ข้อมูลShp", "02_พื้นที่อ่อนไหว", "ตำแหน่งสถานศึกษา_Point.shp"), "name_col": "Name", "do_clip": True, "excel_name": "รร", "sheet": {"EAR": "พื้นที่อ่อนไหว_สถานศึกษา", "EC": None}},
-                {"path": os.path.join(BASE_DIR, "ข้อมูลShp", "02_พื้นที่อ่อนไหว", "ตำแหน่งวัด_Point.shp"), "name_col": "Name", "do_clip": True, "excel_name": "วัด", "sheet": {"EAR": "พื้นที่อ่อนไหว_ศาสนสถาน", "EC": None}},
-                {"path": os.path.join(BASE_DIR, "ข้อมูลShp", "02_พื้นที่อ่อนไหว", "ตำแหน่งโรงพยาบาล_Point.shp"), "name_col": "Name", "do_clip": True, "excel_name": "รพ", "sheet": {"EAR": "พื้นที่อ่อนไหว_สถานพยาบาล", "EC": None}},
-                {"path": os.path.join(BASE_DIR, "ข้อมูลShp", "02_พื้นที่อ่อนไหว", "ตำแหน่งรพสต_Point.shp"), "name_col": "Name", "do_clip": True, "excel_name": "รพสต", "sheet": {"EAR": "พื้นที่อ่อนไหว_สถานพยาบาล", "EC": None}},
+                {"path": "https://gisportal.dmr.go.th/arcgis/rest/services/MINERAL/MIN_AREA/MapServer/0", "name_col": "MIN_GEO", "do_clip": False, "excel_name": "แร่", "sheet": {"EAR": None, "EC": "6.แหล่งทรัพยากรทางธรณี"}},
+                {"path": "https://gis.dmr.go.th/arcgis/rest/services/DMR_Hazard/WebService_DataCatalog_GeoHazard/MapServer/4", "name_col": "Level_T", "do_clip": False, "excel_name": "ดินถล่ม", "sheet": {"EAR": None, "EC": "7.เสี่ยงต่อการเกิดดินถล่ม"}},
+                {"path": "https://gisportal.dmr.go.th/arcgis/rest/services/HAZARD/H_SINKHOLE/MapServer/0", "name_col": "PROV_NAM_T", "do_clip": False, "excel_name": "หลุมยุบ", "sheet": {"EAR": None, "EC": "7.เสี่ยงต่อการเกิดดินถล่ม"}},
+                {"path": "https://gisportal.dmr.go.th/arcgis/rest/services/HAZARD/EQ_ZONE/MapServer/0", "name_col": "INTEN_T", "do_clip": False, "excel_name": "แผ่นดินไหว", "sheet": {"EAR": None, "EC": "8.เสี่ยงต่อการเกิดแผ่นดินไหว"}}
             ])
-        else:
-            shapefiles_to_process.append(
-                {"path": os.path.join(BASE_DIR, "ข้อมูลShp", "shp_พื้นที่อ่อนไหวต่อการเกิดแผ่นดินถล่ม", "SHP_05010103 พื้นที่อ่อนไหวต่อการเกิดแผ่นดินถล่ม", "LANDSLIDE_SUSCEPTIBILITY.shp"), "name_col": "Level_T", "do_clip": True, "excel_name": "ดินถล่ม", "sheet": {"EAR": None, "EC": "7.เสี่ยงต่อการเกิดดินถล่ม"}}
-            )
         
         # เพิ่มไฟล์รายจังหวัดถ้าหาเจอ
         import glob
@@ -181,7 +272,7 @@ def run_pipeline():
             "พระนครศรีอยุธยา": "aya", "พะเยา": "pyo", "พังงา": "pna", "พัทลุง": "plg",
             "พิจิตร": "pck", "พิษณุโลก": "plk", "เพชรบุรี": "pbi", "เพชรบูรณ์": "pnb",
             "แพร่": "pre", "ภูเก็ต": "pkt", "มหาสารคาม": "mkm", "มุกดาหาร": "mdh",
-            "แม่ฮ่องสอน": "msn", "ยโสธร": "yst", "ยะลา": "yla", "ร้อยเอ็ด": "ret",
+            "แม่ฮ่องสอน": "mhs", "ยโสธร": "yst", "ยะลา": "yla", "ร้อยเอ็ด": "ret",
             "ระนอง": "rng", "ระยอง": "ryg", "ราชบุรี": "rbr", "ลพบุรี": "lri",
             "ลำปาง": "lpg", "ลำพูน": "lpn", "เลย": "lei", "ศรีสะเกษ": "ssk",
             "สกลนคร": "snk", "สงขลา": "ska", "สตูล": "stn", "สมุทรปราการ": "spk",
@@ -268,6 +359,9 @@ def run_pipeline():
                     # e.g., LU_LPG_2564 -> LU_merged
                     parts = base_name.split('_')
                     base_name = f"{parts[0]}_merged" if len(parts) > 0 else "merged_shp"
+            elif isinstance(shp_path, str) and shp_path.startswith('http'):
+                is_valid_path = True
+                base_name = shp_info.get("excel_name", shp_path.split('/')[-2])
             elif isinstance(shp_path, str) and os.path.exists(shp_path):
                 is_valid_path = True
                 base_name = os.path.basename(shp_path).replace('.shp', '')
@@ -276,7 +370,22 @@ def run_pipeline():
                 
                 # 4.1 คำนวณจุดตัดเพื่อเอาไปหยอด Excel
                 custom_buffer = shp_info.get("buffer_m_override", buffer_m)
+                
+                # สำหรับ Point layers (เช่น สถานศึกษา, หมู่บ้าน, โบราณสถาน) ให้แนบ crossed_provinces ไปกรองด้วย
+                is_point_layer = any(kw in str(shp_path) for kw in ['ตำแหน่ง', 'หมู่บ้าน', 'historic', 'โรงพยาบาล', 'วัด', 'รพสต'])
+                if is_point_layer:
+                    engine.crossed_provinces = crossed_provinces_thai
+                else:
+                    engine.crossed_provinces = []
+                    
                 df = engine.calculate_intersections(shp_path, shp_info["name_col"], custom_buffer)
+                
+                # Fallback for landslide if REST API fails or returns no data
+                if df.empty and shp_info.get("excel_name") == "ดินถล่ม" and isinstance(shp_path, str) and shp_path.startswith('http'):
+                    fallback_shp = os.path.join(BASE_DIR, "ข้อมูลShp", "shp_พื้นที่อ่อนไหวต่อการเกิดแผ่นดินถล่ม", "SHP_05010103 พื้นที่อ่อนไหวต่อการเกิดแผ่นดินถล่ม", "LANDSLIDE_SUSCEPTIBILITY.shp")
+                    if os.path.exists(fallback_shp):
+                        print(f"  [Fallback] REST API ดินถล่มไม่พบข้อมูล หรือเชื่อมต่อไม่ได้ ลองใช้ไฟล์ Local แทน: {fallback_shp}")
+                        df = engine.calculate_intersections(fallback_shp, "Level_T", custom_buffer)
                 
                 # 4.2 ตัด Shapefile สำหรับทำ Layout (เซฟลง Data_layout)
                 layout_shp_dir = os.path.join(DATA_LAYOUT_DIR, proj_name, "Shp")

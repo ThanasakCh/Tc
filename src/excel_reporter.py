@@ -2,9 +2,23 @@ import os
 import glob
 import shutil
 import json
+import re
 import xlwings as xw
 import geopandas as gpd
 from config import DATA_LAYOUT_DIR, TARGET_CRS
+
+# แมพตัวย่อจังหวัด -> ชื่อจังหวัดเต็ม เพื่อป้องกันข้อมูลเทมเพลตหลุดมาผิดพื้นที่
+PROVINCE_MAP = {
+    "มส": "แม่ฮ่องสอน", "ลป": "ลำปาง", "ชม": "เชียงใหม่",
+    "ชร": "เชียงราย", "พย": "พะเยา", "นน": "น่าน",
+    "พร": "แพร่", "ตาก": "ตาก", "ลพ": "ลำพูน",
+    "กจ": "กาญจนบุรี", "นม": "นครราชสีมา", "ขก": "ขอนแก่น",
+    "อด": "อุดรธานี", "สร": "สุรินทร์", "นพ": "นครพนม",
+    "สน": "สกลนคร", "มค": "มหาสารคาม", "รอ": "ร้อยเอ็ด",
+    "อบ": "อุบลราชธานี", "ศก": "ศรีสะเกษ", "บร": "บุรีรัมย์",
+    "ชย": "ชัยภูมิ", "นศ": "นครศรีธรรมราช", "สฎ": "สุราษฎร์ธานี",
+    "พง": "พังงา", "กบ": "กระบี่", "ตง": "ตรัง", "สข": "สงขลา",
+}
 
 class ExcelReporter:
     def __init__(self, project_dir):
@@ -12,6 +26,16 @@ class ExcelReporter:
         self.project_name = os.path.basename(project_dir)
         self.cache_dir = os.path.join(project_dir, "cache")
         self.output_dir = os.path.join(DATA_LAYOUT_DIR, self.project_name)
+        
+        # ดึงจังหวัดจากชื่อโปรเจกต์เพื่อป้องกันข้อมูลเทมเพลตผิดพื้นที่
+        self.project_province = ""
+        for part in self.project_name.split('_'):
+            clean_part = re.sub(r'[\d\.]', '', part).strip()
+            if clean_part in PROVINCE_MAP:
+                self.project_province = PROVINCE_MAP[clean_part]
+                break
+        if self.project_province:
+            print(f"[ExcelReporter] พื้นที่โครงการ: จังหวัด{self.project_province}")
 
     def prepare_output_file(self):
         os.makedirs(self.output_dir, exist_ok=True)
@@ -19,10 +43,20 @@ class ExcelReporter:
         os.makedirs(backup_dir, exist_ok=True)
 
         excel_files = glob.glob(os.path.join(self.project_dir, "*.xlsx"))
-        excel_files = [f for f in excel_files if "_backup" not in f]
+        excel_files = [f for f in excel_files if "_backup" not in f and not os.path.basename(f).startswith("test")]
 
-        if not excel_files:
-            print("ไม่พบไฟล์ Excel ในโฟลเดอร์... กำลังดึง Master Template อัตโนมัติ!")
+        template_path = None
+        expected_name = f"{self.project_name}.xlsx"
+        for f in excel_files:
+            if os.path.basename(f) == expected_name:
+                template_path = f
+                break
+        
+        if not template_path and excel_files:
+            template_path = excel_files[0]
+
+        if not template_path:
+            print("ไม่พบไฟล์ Excel ต้นฉบับ... ดึงจาก Master Template อัตโนมัติ!")
             from config import BASE_DIR
             master_dir = os.path.join(BASE_DIR, "Excel_Templates")
             if "EAR" in self.project_name.upper():
@@ -30,27 +64,32 @@ class ExcelReporter:
             else:
                 master_file = os.path.join(master_dir, "Template_EC.xlsx")
             if os.path.exists(master_file):
-                new_excel_path = os.path.join(self.project_dir, f"{self.project_name}.xlsx")
+                new_excel_path = os.path.join(self.project_dir, expected_name)
                 shutil.copy(master_file, new_excel_path)
-                excel_files = [new_excel_path]
+                template_path = new_excel_path
             else:
                 return None
 
-        template_path = excel_files[0]
         base_name = os.path.basename(template_path)
         output_path = os.path.join(self.output_dir, base_name)
 
         from datetime import datetime
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         backup_path = os.path.join(backup_dir, f"{base_name.replace('.xlsx', '')}_{timestamp}.xlsx")
-
-        try:
-            shutil.copy2(template_path, backup_path)
-            shutil.copy2(template_path, output_path)
-        except PermissionError:
-            print(f"\n[ERROR] ไม่สามารถเขียนทับไฟล์ผลลัพธ์ได้เนื่องจากไฟล์ถูกเปิดค้างอยู่!")
-            print(f"กรุณาปิดไฟล์ Excel: '{output_path}' ก่อนทำการรันใหม่อีกครั้ง!\n")
-            raise PermissionError(f"Excel file is locked: {output_path}")
+        import time
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                shutil.copy2(template_path, backup_path)
+                shutil.copy2(template_path, output_path)
+                break
+            except PermissionError:
+                if attempt < max_retries - 1:
+                    time.sleep(1)
+                else:
+                    print(f"\n[WARNING] ไฟล์ผลลัพธ์เดิมถูกเปิดค้างอยู่ จะทำการบันทึกเป็นไฟล์ใหม่แทน!")
+                    output_path = output_path.replace(".xlsx", f"_{timestamp}.xlsx")
+                    shutil.copy2(template_path, output_path)
         return output_path
 
     def load_cache(self):
@@ -86,6 +125,31 @@ class ExcelReporter:
                     pass
                 return sht
         return None
+
+    def _clear_template_defaults(self, wb, is_ear):
+        """ล้างข้อมูลตัวอย่างจากเทมเพลตทุกชีตก่อนเขียนข้อมูลจริง
+        ป้องกันข้อมูลเทมเพลต (เช่น จังหวัดลำปาง) หลุดมาผิดพื้นที่"""
+        print(f"  ล้างข้อมูลตัวอย่างจากเทมเพลต (ป้องกันข้อมูลผิดพื้นที่)...")
+        
+        if not is_ear:
+            # ชีต 3: ตรวจสอบสถานศึกษา - ล้างข้อมูลตัวอย่างทั้ง 3 ตาราง
+            sht3 = self._find_sheet(wb, "3.ตรวจสอบสถานศึกษา")
+            if sht3:
+                for col in ['A', 'B', 'D', 'E', 'F']:
+                    self._safe_clear(sht3, col, 3, 17)   # โรงเรียน
+                    self._safe_clear(sht3, col, 20, 30)   # ศาสนสถาน
+                    self._safe_clear(sht3, col, 33, 42)   # สถานพยาบาล
+            
+            # ชีต 6: แหล่งทรัพยากรทางธรณี - ล้างข้อมูลตัวอย่าง
+            sht6 = self._find_sheet(wb, "6.แหล่งทรัพยากรทางธรณี")
+            if sht6:
+                for col in ['A', 'B', 'C', 'D']:
+                    self._safe_clear(sht6, col, 2, 50)
+                    
+            # ชีต 8: แผ่นดินไหว - ล้างข้อมูลตัวอย่าง (ลบคำว่า "จังหวัดลำปาง" ฯลฯ)
+            sht8 = self._find_sheet(wb, "8.เสี่ยงต่อการเกิดแผ่นดินไหว")
+            if sht8:
+                self._safe_clear(sht8, 'A', 1, 15)
 
     def _get_buffer_areas(self):
         """หาพื้นที่บัฟเฟอร์รวมของโครงการ (1000ม. และ 30ม.)"""
@@ -317,15 +381,21 @@ class ExcelReporter:
                 a_name = 'ไม่ระบุ'
             if a_name not in grouped:
                 grouped[a_name] = {'kms': [], 'area_sqm': 0, 'length_km': 0.0}
-            km_str = f"{r['KM In']} - {r['KM Out']}"
-            grouped[a_name]['kms'].append(km_str)
+                
+            if is_ear:
+                km_str = f"{r.get('KM In', '')}, {r.get('KM Out', '')}".strip(', ')
+            else:
+                km_in = r.get('KM In', '').strip()
+                km_str = f"กม.ที่ {km_in}" if km_in else ""
+                
+            if km_str and km_str not in grouped[a_name]['kms']:
+                grouped[a_name]['kms'].append(km_str)
             grouped[a_name]['area_sqm'] += r.get('intersect_area_sqm', 0)
             grouped[a_name]['length_km'] += r.get('length_m', 0) / 1000
 
         total_sqkm = 0
         total_sqm = 0
         total_rai = 0
-        self._set_cell_value_only(sht, "E2", "ระยะทาง (กม.)")
         total_length_km = 0.0
         
         rows_to_delete = []
@@ -353,24 +423,31 @@ class ExcelReporter:
                 self._set_cell_value_only(sht, f"B{row}", round(area_sqkm, 6))
                 self._set_cell_value_only(sht, f"C{row}", round(area_sqm, 2))
                 self._set_cell_value_only(sht, f"D{row}", round(area_rai, 6))
-                self._set_cell_value_only(sht, f"E{row}", round(data['length_km'], 3))
-                self._set_cell_value_only(sht, f"F{row}", "\n".join(data['kms']))
+                
+                if is_ear:
+                    self._set_cell_value_only(sht, f"E{row}", "") # leave blank or calculate percentage
+                    self._set_cell_value_only(sht, f"F{row}", "\n".join(data['kms']))
+                else:
+                    self._set_cell_value_only(sht, f"E{row}", "\n".join(data['kms']))
 
                 total_sqkm += area_sqkm
                 total_sqm += area_sqm
                 total_rai += area_rai
                 total_length_km += data['length_km']
             else:
-                rows_to_delete.append(row)
+                if is_ear:
+                    rows_to_delete.append(row)
+                else:
+                    # In EC, don't delete. Write 'ไม่ตัดผ่านแนวเส้น'
+                    self._set_cell_value_only(sht, f"B{row}", "-")
+                    self._set_cell_value_only(sht, f"C{row}", "-")
+                    self._set_cell_value_only(sht, f"D{row}", "-")
+                    self._set_cell_value_only(sht, f"E{row}", "ไม่ตัดผ่านแนวเส้น")
 
         if total_row:
             self._set_cell_value_only(sht, f"B{total_row}", round(total_sqkm, 6))
             self._set_cell_value_only(sht, f"C{total_row}", round(total_sqm, 2))
             self._set_cell_value_only(sht, f"D{total_row}", round(total_rai, 6))
-            self._set_cell_value_only(sht, f"E{total_row}", round(total_length_km, 3))
-            
-            # User requested to remove the overall km range at the bottom of column F
-            # self._set_cell_value_only(sht, f"F{total_row}", overall_km)
             
         for r in reversed(rows_to_delete):
             sht.range(f"{r}:{r}").delete(shift='up')
@@ -496,49 +573,58 @@ class ExcelReporter:
             row += 1
             idx += 1
 
-    def _write_sheet_landslide_lookup(self, wb, records, is_ear=True):
-        """ชีท 7.เสี่ยงต่อการเกิดดินถล่ม (EC เท่านั้น)"""
-        if is_ear:
-            return
-
-        sht = self._find_sheet(wb, "7.เสี่ยงต่อการเกิดดินถล่ม")
+    def _write_sheet_mineral_ec(self, wb, records):
+        """ชีท 6.แหล่งทรัพยากรทางธรณี (EC เท่านั้น)"""
+        sht = self._find_sheet(wb, "6.แหล่งทรัพยากรทางธรณี")
         if not sht:
             return
         print(f"  กำลังหยอดชีท '{sht.name}'...")
-
-        self._safe_clear(sht, 'F', 3, 20)
-        self._safe_clear(sht, 'G', 3, 20)
-
+        
+        # Clear existing
+        for col in ['A', 'B', 'C', 'D']:
+            self._safe_clear(sht, col, 2, 50)
+            
         if not records:
             return
-
-        grouped = {}
+            
+        row = 2
         for r in records:
-            a_name = str(r.get('area_name', 'ไม่ระบุ'))
-            if a_name in ('None', 'nan', ''):
-                continue
-            if a_name not in grouped:
-                grouped[a_name] = {'kms': [], 'length_km': 0}
-            km_str = f"{r['KM In']} - {r['KM Out']}"
-            grouped[a_name]['kms'].append(km_str)
-            grouped[a_name]['length_km'] += r.get('length_m', 0) / 1000
+            props = r.get('properties', {})
+            # Name from COMNAME_T
+            name = props.get('COMNAME_T', 'ไม่ระบุ')
+            desc = props.get('MIN_GEO', '')
+            
+            self._set_cell_value_only(sht, f"A{row}", name)
+            self._set_cell_value_only(sht, f"B{row}", "www.dmr.go.th")
+            row += 1
+            
+            self._set_cell_value_only(sht, f"A{row}", desc)
+            row += 1
+            
+    def _write_sheet_earthquake_ec(self, wb, records):
+        """ชีท 8.เสี่ยงต่อการเกิดแผ่นดินไหว (EC เท่านั้น)"""
+        sht = self._find_sheet(wb, "8.เสี่ยงต่อการเกิดแผ่นดินไหว")
+        if not sht: return
+        
+        # ล้างข้อความเดิมในคอลัมน์ A (เพื่อลบคำว่า จังหวัดลำปาง ในเทมเพลต)
+        self._safe_clear(sht, 'A', 1, 10)
+        
+        if not records: return
+        
+        # ดึงข้อความที่ไม่ซ้ำจาก API (area_name)
+        areas = list(set(r.get('area_name') for r in records if r.get('area_name') and r.get('area_name') not in ('None', 'nan', '')))
+        if areas:
+            self._set_cell_value_only(sht, "A1", "พื้นที่เสี่ยงต่อการเกิดแผ่นดินไหว")
+            row = 2
+            for a in areas:
+                self._set_cell_value_only(sht, f"A{row}", a)
+                row += 1
 
-        for row in range(3, 20):
-            cell_val = sht.range(f"B{row}").value
-            if not cell_val:
-                continue
-            cell_str = str(cell_val).strip()
-
-            matched_level = None
-            for g_level in grouped.keys():
-                if g_level.lower() in cell_str.lower() or cell_str.lower() in g_level.lower():
-                    matched_level = g_level
-                    break
-
-            if matched_level:
-                data = grouped[matched_level]
-                self._set_cell_value_only(sht, f"F{row}", "\n".join(data['kms']))
-                self._set_cell_value_only(sht, f"G{row}", round(data['length_km'], 3))
+    def _write_sheet_landslide_lookup(self, wb, records, is_ear=True):
+        """ชีท 7.เสี่ยงต่อการเกิดดินถล่ม (EC เท่านั้น)"""
+        # ผู้ใช้แจ้งว่าไม่ต้องการตัวเลขกิโลเมตร ต้องการแค่ตัวหนังสือแบบเทมเพลต
+        # ดังนั้นข้ามการหยอดตัวเลขในโหมด EC
+        pass
 
     def _prepare_sub_rows(self, sht, start_row, end_row, target_count):
         """
@@ -741,6 +827,107 @@ class ExcelReporter:
                         pass
                 row += 1
                 idx += 1
+
+    def _write_sheet_schools_ec(self, wb, master_records):
+        """เขียนชีท 3.ตรวจสอบสถานศึกษา (EC) รองรับสถานศึกษา วัด และสถานพยาบาล"""
+        sht = self._find_sheet(wb, "3.ตรวจสอบสถานศึกษา")
+        if not sht:
+            return
+        print(f"  กำลังหยอดชีท '{sht.name}'...")
+        
+        # จัดเตรียมข้อมูล
+        schools = master_records.get('3.ตรวจสอบสถานศึกษา', [])
+        temples = master_records.get('3.ตรวจสอบสถานศึกษา_วัด', [])
+        hospitals = master_records.get('3.ตรวจสอบสถานศึกษา_รพ', [])
+        hospitals.extend(master_records.get('3.ตรวจสอบสถานศึกษา_รพสต', []))
+        
+        def format_records(records_list):
+            grp = []
+            for r in records_list:
+                a_name = str(r.get('area_name', 'ไม่ระบุ'))
+                if a_name in ('None', 'nan', ''): continue
+                props = r.get('properties', {})
+                grp.append({
+                    'name': a_name,
+                    'tambon': props.get('TAMBOL_TH', props.get('TAMBON', '')),
+                    'amphoe': props.get('AMPHOE_TH', props.get('AMPHOE', '')),
+                    'province': props.get('PROV_TH', props.get('PROVINCE', ''))
+                })
+            return grp
+            
+        schools_grp = format_records(schools)
+        temples_grp = format_records(temples)
+        hospitals_grp = format_records(hospitals)
+        
+        # ถ้าไม่มีข้อมูลเลย ให้ใส่ '-' เฉพาะช่องแรกของแต่ละตาราง
+        if not schools_grp: schools_grp = [{'name': '-', 'tambon': '-', 'amphoe': '-', 'province': '-'}]
+        if not temples_grp: temples_grp = [{'name': '-', 'tambon': '-', 'amphoe': '-', 'province': '-'}]
+        if not hospitals_grp: hospitals_grp = [{'name': '-', 'tambon': '-', 'amphoe': '-', 'province': '-'}]
+
+        # ล้างข้อมูลเดิมในช่องกรอก (แถว 3-17 สำหรับโรงเรียน, 19-30 สำหรับวัด, 32-42 สำหรับ รพ)
+        # แต่เพื่อความปลอดภัย เราจะเขียนทับไปเลย
+        # เริ่มเขียนโรงเรียน (เริ่มแถว 3)
+        row = 3
+        idx = 1
+        for data in schools_grp:
+            if row > 17: break
+            self._set_cell_value_only(sht, f"A{row}", idx if data['name'] != '-' else '-')
+            self._set_cell_value_only(sht, f"B{row}", data['name'])
+            self._set_cell_value_only(sht, f"D{row}", data['tambon'])
+            self._set_cell_value_only(sht, f"E{row}", data['amphoe'])
+            self._set_cell_value_only(sht, f"F{row}", data['province'])
+            row += 1
+            idx += 1
+            
+        # ล้างแถวว่างที่เหลือของโรงเรียน
+        for r in range(row, 18):
+            self._safe_clear(sht, 'A', r, r)
+            self._safe_clear(sht, 'B', r, r)
+            self._safe_clear(sht, 'D', r, r)
+            self._safe_clear(sht, 'E', r, r)
+            self._safe_clear(sht, 'F', r, r)
+
+        # เริ่มเขียนวัด (เริ่มแถว 20)
+        row = 20
+        idx = 1
+        for data in temples_grp:
+            if row > 30: break
+            self._set_cell_value_only(sht, f"A{row}", idx if data['name'] != '-' else '-')
+            self._set_cell_value_only(sht, f"B{row}", data['name'])
+            self._set_cell_value_only(sht, f"D{row}", data['tambon'])
+            self._set_cell_value_only(sht, f"E{row}", data['amphoe'])
+            self._set_cell_value_only(sht, f"F{row}", data['province'])
+            row += 1
+            idx += 1
+            
+        # ล้างแถวว่างที่เหลือของวัด
+        for r in range(row, 31):
+            self._safe_clear(sht, 'A', r, r)
+            self._safe_clear(sht, 'B', r, r)
+            self._safe_clear(sht, 'D', r, r)
+            self._safe_clear(sht, 'E', r, r)
+            self._safe_clear(sht, 'F', r, r)
+
+        # เริ่มเขียนโรงพยาบาล (เริ่มแถว 33)
+        row = 33
+        idx = 1
+        for data in hospitals_grp:
+            if row > 42: break
+            self._set_cell_value_only(sht, f"A{row}", idx if data['name'] != '-' else '-')
+            self._set_cell_value_only(sht, f"B{row}", data['name'])
+            self._set_cell_value_only(sht, f"D{row}", data['tambon'])
+            self._set_cell_value_only(sht, f"E{row}", data['amphoe'])
+            self._set_cell_value_only(sht, f"F{row}", data['province'])
+            row += 1
+            idx += 1
+            
+        # ล้างแถวว่างที่เหลือของ รพ
+        for r in range(row, 43):
+            self._safe_clear(sht, 'A', r, r)
+            self._safe_clear(sht, 'B', r, r)
+            self._safe_clear(sht, 'D', r, r)
+            self._safe_clear(sht, 'E', r, r)
+            self._safe_clear(sht, 'F', r, r)
 
     def _write_sheet_stream(self, wb, records, is_ear=True):
         """ชีท 5.จุดตัดแหล่งน้ำ / 9.จุดตัดแหล่งน้ำ (เขียนเรียงแถวลงมา และแทรกแถวเพิ่มหากแถวไม่พอ)"""
@@ -960,6 +1147,100 @@ class ExcelReporter:
         # 2. ตารางล่าง (ในเขตทาง 30ม.) -> แถวข้อมูล 15-19, รวมแถว 20
         self._fill_erosion_table(sht, records_30m, 15, 20)
 
+
+    def _write_sheet_landuse_sequential_ec(self, wb, records):
+        """ชีท 4.การใช้ประโยชน์ที่ดิน (EC แบบกางบรรทัดใหม่ทั้งหมด)"""
+        sht = self._find_sheet(wb, "4.การใช้ประโยชน์ที่ดิน")
+        if not sht: return
+        print(f"  กำลังหยอดชีท '{sht.name}' แบบ List...")
+        
+        self._safe_clear(sht, 'A', 2, 74)
+        self._safe_clear(sht, 'B', 2, 74)
+        self._safe_clear(sht, 'C', 2, 74)
+        self._safe_clear(sht, 'D', 2, 74)
+        
+        if not records: return
+        
+        grouped = {}
+        total_sqm = 0.0
+        for r in records:
+            a_name = str(r.get('area_name', 'ไม่ระบุ'))
+            if a_name in ('None', 'nan', ''): continue
+            props = r.get('properties', {})
+            lu_name = None
+            for key in ['LU_NAME', 'lu_name', 'LU_DES_TH', 'lu_des_th', 'LU_DES', 'lu_des', 'LU_DES_EN', 'lu_des_en']:
+                for prop_key, prop_val in props.items():
+                    if prop_key.lower() == key.lower():
+                        lu_name = prop_val
+                        break
+                if lu_name is not None: break
+            if lu_name is None: lu_name = a_name
+            grouped[lu_name] = grouped.get(lu_name, 0.0) + r.get('intersect_area_sqm', 0.0)
+            total_sqm += r.get('intersect_area_sqm', 0.0)
+            
+        if total_sqm <= 0: return
+        
+        LU_CLASSIFICATION = {
+            '1. พื้นที่เกษตรกรรม': ['นา', 'ไร่', 'สวน', 'พืช', 'ทุ่ง', 'เลี้ยงสัตว์', 'เกษตร', 'a'],
+            '2. พื้นที่ป่าไม้': ['ป่า', 'ไม้', 'f'],
+            '3. พื้นที่แหล่งน้ำ': ['น้ำ', 'คลอง', 'อ่าง', 'บ่อ', 'ทะเลสาบ', 'หนอง', 'บึง', 'w'],
+            '4. พื้นที่ชุมชนและสิ่งปลูกสร้าง': ['ชุมชน', 'หมู่บ้าน', 'เมือง', 'สิ่งปลูกสร้าง', 'ถนน', 'สนามบิน', 'โรงงาน', 'u'],
+            '5. พื้นที่เบ็ดเตล็ด': ['ว่าง', 'เบ็ดเตล็ด', 'เหมือง', 'm']
+        }
+        
+        cats = {k: {} for k in LU_CLASSIFICATION.keys()}
+        for g_key, area in grouped.items():
+            g_clean = str(g_key).lower()
+            matched_p = '5. พื้นที่เบ็ดเตล็ด'
+            for p_name, keywords in LU_CLASSIFICATION.items():
+                if any(kw == g_clean or (len(kw) > 1 and kw in g_clean) for kw in keywords):
+                    matched_p = p_name
+                    break
+            cats[matched_p][g_key] = area
+            
+        row = 2
+        for p_name, items in cats.items():
+            if not items: continue
+            
+            p_area = sum(items.values())
+            self._set_cell_value_only(sht, f"A{row}", p_name)
+            self._set_cell_value_only(sht, f"B{row}", round(p_area/1_000_000, 6))
+            self._set_cell_value_only(sht, f"C{row}", round(p_area/1600, 2))
+            self._set_cell_value_only(sht, f"D{row}", round(p_area/total_sqm*100, 2))
+            
+            try:
+                tr = sht.range(f"A{row}:D{row}")
+                tr.api.Font.Bold = True
+            except: pass
+            
+            row += 1
+            
+            for lu_name, area in items.items():
+                self._set_cell_value_only(sht, f"A{row}", f"    {lu_name}")
+                self._set_cell_value_only(sht, f"B{row}", round(area/1_000_000, 6))
+                self._set_cell_value_only(sht, f"C{row}", round(area/1600, 2))
+                self._set_cell_value_only(sht, f"D{row}", round(area/total_sqm*100, 2))
+                row += 1
+                
+        self._set_cell_value_only(sht, f"A{row}", "รวม")
+        self._set_cell_value_only(sht, f"B{row}", round(total_sqm/1_000_000, 6))
+        self._set_cell_value_only(sht, f"C{row}", round(total_sqm/1600, 2))
+        self._set_cell_value_only(sht, f"D{row}", 100.0)
+        try:
+            tr = sht.range(f"A{row}:D{row}")
+            tr.api.Font.Bold = True
+            tr.color = (217, 217, 217)
+            for b_id in [7, 8, 9, 10, 11, 12]:
+                tr.api.Borders(b_id).LineStyle = 1
+                tr.api.Borders(b_id).Weight = 2
+        except: pass
+        
+        try:
+            if row < 74:
+                # Clear all formats and borders for unused rows
+                sht.range(f"A{row+1}:D74").clear()
+        except: pass
+
     def _write_sheet_landuse_lookup(self, wb, records, is_ear=True):
         """ชีท การใช้ประโยชน์ที่ดิน แบบแมปค่าตามประเภทที่มีและคำนวณยอดรวมหัวข้อใหญ่"""
         sheet_name = "8.การใช้ประโยชน์ที่ดิน" if is_ear else "4.การใช้ประโยชน์ที่ดิน"
@@ -1001,15 +1282,30 @@ class ExcelReporter:
         if total_sqm <= 0:
             return
 
-        # 1. เขียนข้อมูลระดับกิ่ง (Leaf Nodes) แถว 2 ถึง 73
-        parent_rows = [2, 44, 48, 59, 69]
-        total_row = 74
+        # 1. ค้นหาแถวของหมวดหมู่หลัก (Parent Nodes) และช่องรวม (Total Row) แบบอัตโนมัติ
+        parent_rows = []
+        total_row = None
+        for r in range(2, 100):
+            val = sht.range(f"A{r}").value
+            if not val:
+                continue
+            val_str = str(val).strip()
+            if any(val_str.startswith(prefix) for prefix in ["1.", "2.", "3.", "4.", "5."]):
+                parent_rows.append(r)
+            elif "รวม" in val_str:
+                total_row = r
+                break
+                
+        if not total_row:
+            total_row = 74 # fallback
+            
+        end_leaf_row = total_row - 1
 
         matched_keys_set = set()
         row_matches = {}
 
         # Pass 1: Exact match
-        for row in range(2, 74):
+        for row in range(2, end_leaf_row + 1):
             if row in parent_rows:
                 continue
             cell_val = sht.range(f"A{row}").value
@@ -1026,7 +1322,7 @@ class ExcelReporter:
                     break
 
         # Pass 2: Substring match
-        for row in range(2, 74):
+        for row in range(2, end_leaf_row + 1):
             if row in parent_rows or row in row_matches:
                 continue
             cell_val = sht.range(f"A{row}").value
@@ -1043,7 +1339,7 @@ class ExcelReporter:
                     break
 
         # Write matched values
-        for row in range(2, 74):
+        for row in range(2, end_leaf_row + 1):
             if row in parent_rows:
                 continue
             if row in row_matches:
@@ -1057,14 +1353,46 @@ class ExcelReporter:
                 self._set_cell_value_only(sht, f"C{row}", round(area_rai, 2))
                 self._set_cell_value_only(sht, f"D{row}", round(pct, 2))
 
-        # 2. คำนวณหัวข้อใหญ่ (Parent Nodes) จากผลรวมของแถวย่อย
-        parent_ranges = {
-            2: (3, 43),
-            44: (45, 46),
-            48: (49, 58),
-            59: (60, 67),
-            69: (70, 73)
+        # Pass 3: Classify unmatched keys to parent categories
+        LU_CLASSIFICATION = {
+            'เกษตรกรรม': ['นา', 'ไร่', 'สวน', 'พืช', 'ทุ่ง', 'เลี้ยงสัตว์', 'เกษตร', 'a'],
+            'ป่าไม้': ['ป่า', 'ไม้', 'f'],
+            'แหล่งน้ำ': ['น้ำ', 'คลอง', 'อ่าง', 'บ่อ', 'ทะเลสาบ', 'หนอง', 'บึง', 'w'],
+            'ชุมชนและสิ่งปลูกสร้าง': ['ชุมชน', 'หมู่บ้าน', 'เมือง', 'สิ่งปลูกสร้าง', 'ถนน', 'สนามบิน', 'โรงงาน', 'u'],
+            'เบ็ดเตล็ด': ['ว่าง', 'เบ็ดเตล็ด', 'เหมือง', 'm']
         }
+        
+        parent_unmatched_area = {p_row: 0.0 for p_row in parent_rows}
+        
+        for g_key, area in grouped.items():
+            if g_key not in matched_keys_set:
+                g_clean = str(g_key).lower()
+                matched_p = None
+                for p_name, keywords in LU_CLASSIFICATION.items():
+                    # For single character codes like 'a', 'f', 'w', 'u', 'm', check exact or prefix
+                    if any(kw == g_clean or (len(kw) > 1 and kw in g_clean) for kw in keywords):
+                        matched_p = p_name
+                        break
+                
+                if not matched_p:
+                    matched_p = 'เบ็ดเตล็ด'
+                    
+                for p_row in parent_rows:
+                    p_val = str(sht.range(f"A{p_row}").value)
+                    if matched_p in p_val:
+                        parent_unmatched_area[p_row] += area
+                        break
+
+        # 2. คำนวณหัวข้อใหญ่ (Parent Nodes) จากผลรวมของแถวย่อยแบบอัตโนมัติ
+        parent_ranges = {}
+        for i in range(len(parent_rows)):
+            p_row = parent_rows[i]
+            start_child = p_row + 1
+            if i < len(parent_rows) - 1:
+                end_child = parent_rows[i+1] - 1
+            else:
+                end_child = total_row - 1
+            parent_ranges[p_row] = (start_child, end_child)
 
         total_parent_sqkm = 0.0
         total_parent_rai = 0.0
@@ -1082,7 +1410,11 @@ class ExcelReporter:
                 if val_rai: p_rai += float(val_rai)
                 if val_pct: p_pct += float(val_pct)
 
-            if p_sqkm > 0:
+            if p_sqkm > 0 or parent_unmatched_area[p_row] > 0:
+                p_sqkm += parent_unmatched_area[p_row] / 1_000_000
+                p_rai += parent_unmatched_area[p_row] / 1600
+                p_pct += (parent_unmatched_area[p_row] / total_sqm * 100)
+                
                 self._set_cell_value_only(sht, f"B{p_row}", round(p_sqkm, 6))
                 self._set_cell_value_only(sht, f"C{p_row}", round(p_rai, 2))
                 self._set_cell_value_only(sht, f"D{p_row}", round(p_pct, 2))
@@ -1109,15 +1441,7 @@ class ExcelReporter:
             except Exception:
                 pass
             
-        # 4. ลบแถวที่ไม่มีข้อมูล
-        rows_to_delete = []
-        for r in range(2, 74):
-            val_sqkm = sht.range(f"B{r}").value
-            if not val_sqkm or float(val_sqkm) <= 0:
-                rows_to_delete.append(r)
-                
-        for r in reversed(rows_to_delete):
-            sht.range(f"{r}:{r}").delete(shift='up')
+        # 4. ไม่ลบแถวที่ไม่มีข้อมูล เพื่อคงโครงสร้าง 5 หมวดหลักไว้
             
         # หาบรรทัดรวมใหม่ (เพราะแถวเลื่อน) เพื่อขีดเส้นหรือแก้ไขในอนาคตถ้าต้องการ
         # ไม่จำเป็นต้องแก้ เพราะเขียนข้อมูลไปหมดแล้ว
@@ -1385,6 +1709,9 @@ class ExcelReporter:
         try:
             wb = app.books.open(output_path)
 
+            # ล้างข้อมูลตัวอย่างจากเทมเพลตก่อนเขียนข้อมูลจริง (ป้องกันข้อมูลผิดพื้นที่)
+            self._clear_template_defaults(wb, is_ear)
+
             # 1. ชีท 1.ป่า (ป่าสงวน & ป่าถาวร)
             self._write_sheet_pa(wb, master_records.get('1.ป่า_สงวน'), master_records.get('1.ป่า'))
 
@@ -1410,6 +1737,9 @@ class ExcelReporter:
                 self._write_sheet_sensitive_sequential(wb, master_records)
             else:
                 self._write_sheet_landslide_lookup(wb, master_records.get('7.เสี่ยงต่อการเกิดดินถล่ม'), is_ear)
+                self._write_sheet_schools_ec(wb, master_records)
+                self._write_sheet_mineral_ec(wb, master_records.get('6.แหล่งทรัพยากรทางธรณี'))
+                self._write_sheet_earthquake_ec(wb, master_records.get('8.เสี่ยงต่อการเกิดแผ่นดินไหว'))
 
             # 7. ชีท 5/9.จุดตัดแหล่งน้ำ (เขียนแบบเรียงแถวใหม่)
             self._write_sheet_stream(wb, master_records.get('5.จุดตัดแหล่งน้ำ' if is_ear else '9.จุดตัดแหล่งน้ำ'), is_ear)
@@ -1425,11 +1755,28 @@ class ExcelReporter:
                 is_ear
             )
 
-            # 10. ชีท 8/4.การใช้ประโยชน์ที่ดิน (ใช้แบบ Lookup & คำนวณผลรวมระดับหัวข้อ)
-            self._write_sheet_landuse_lookup(wb, master_records.get('8.การใช้ประโยชน์ที่ดิน' if is_ear else '4.การใช้ประโยชน์ที่ดิน'), is_ear)
+            # 10. ชีท 8/4.การใช้ประโยชน์ที่ดิน
+            if is_ear:
+                self._write_sheet_landuse_lookup(wb, master_records.get('8.การใช้ประโยชน์ที่ดิน'), is_ear)
+            else:
+                self._write_sheet_landuse_sequential_ec(wb, master_records.get('4.การใช้ประโยชน์ที่ดิน'))
 
             # 11. ชีท 6/10.ลาดชันของพื้นที่ (ดึงความสูงจริงและคำนวณเฉลี่ยอัตโนมัติ)
             self._write_sheet_slope(wb, is_ear)
+
+            print("กำลังจัดเรียงชีตตามตัวเลข...")
+            try:
+                sheet_names = [sht.name for sht in wb.sheets]
+                import re
+                def get_sheet_num(s):
+                    m = re.match(r'^(\d+)', s)
+                    return int(m.group(1)) if m else 999
+                    
+                sorted_names = sorted(sheet_names, key=get_sheet_num)
+                for s_name in sorted_names:
+                    wb.sheets[s_name].api.Move(After=wb.sheets[-1].api)
+            except Exception as e:
+                print(f"  Warning: ไม่สามารถจัดเรียงชีตได้: {e}")
 
             print("บันทึกและปิดไฟล์ Excel...")
             wb.save()

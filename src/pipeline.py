@@ -270,13 +270,13 @@ def run_pipeline():
             "นราธิวาส": "nwt", "น่าน": "nan", "บึงกาฬ": "bkn", "บุรีรัมย์": "brm",
             "ปทุมธานี": "ptm", "ประจวบคีรีขันธ์": "pkn", "ปราจีนบุรี": "pri", "ปัตตานี": "ptn",
             "พระนครศรีอยุธยา": "aya", "พะเยา": "pyo", "พังงา": "pna", "พัทลุง": "plg",
-            "พิจิตร": "pck", "พิษณุโลก": "plk", "เพชรบุรี": "pbi", "เพชรบูรณ์": "pnb",
+            "พิจิตร": "pct", "พิษณุโลก": "plk", "เพชรบุรี": "pbi", "เพชรบูรณ์": "pbn",
             "แพร่": "pre", "ภูเก็ต": "pkt", "มหาสารคาม": "mkm", "มุกดาหาร": "mdh",
-            "แม่ฮ่องสอน": "mhs", "ยโสธร": "yst", "ยะลา": "yla", "ร้อยเอ็ด": "ret",
+            "แม่ฮ่องสอน": "msn", "ยโสธร": "yst", "ยะลา": "yla", "ร้อยเอ็ด": "ret",
             "ระนอง": "rng", "ระยอง": "ryg", "ราชบุรี": "rbr", "ลพบุรี": "lri",
             "ลำปาง": "lpg", "ลำพูน": "lpn", "เลย": "lei", "ศรีสะเกษ": "ssk",
-            "สกลนคร": "snk", "สงขลา": "ska", "สตูล": "stn", "สมุทรปราการ": "spk",
-            "สมุทรสงคราม": "skm", "สมุทรสาคร": "skn", "สระแก้ว": "skw", "สระบุรี": "sri",
+            "สกลนคร": "snk", "สงขลา": "ska", "สตูล": "stn", "สมุทรปราการ": "smp",
+            "สมุทรสงคราม": "skm", "สมุทรสาคร": "skn", "สระแก้ว": "sko", "สระบุรี": "sri",
             "สิงห์บุรี": "sbr", "สุโขทัย": "sti", "สุพรรณบุรี": "spb", "สุราษฎร์ธานี": "sni",
             "สุรินทร์": "srn", "หนองคาย": "nki", "หนองบัวลำภู": "nbl", "อ่างทอง": "atg",
             "อำนาจเจริญ": "anc", "อุดรธานี": "udn", "อุตรดิตถ์": "utt", "อุทัยธานี": "uti",
@@ -295,13 +295,7 @@ def run_pipeline():
             soil_f = glob.glob(os.path.join(BASE_DIR, "ข้อมูลShp", "00_Soil_1ต่อ25000", f"*{prov_thai}*.shp"))
             if soil_f: soil_files_all.extend(soil_f)
             
-            # การชะล้าง
-            ero_f = []
-            if prov_eng:
-                ero_f = glob.glob(os.path.join(BASE_DIR, "ข้อมูลShp", "08_การชะล้างพังทลายของดิน_2563", "**", f"*{prov_eng}*.shp"), recursive=True)
-            if not ero_f:
-                ero_f = glob.glob(os.path.join(BASE_DIR, "ข้อมูลShp", "08_การชะล้างพังทลายของดิน_2563", "**", f"*{prov_thai}*.shp"), recursive=True)
-            if ero_f: ero_files_all.extend(ero_f)
+            # การชะล้างย้ายไปหาด้วยพิกัด Bounding Box แทนเพื่อความแม่นยำ 100%
             
             # การใช้ประโยชน์ที่ดิน
             luse_f = []
@@ -335,8 +329,39 @@ def run_pipeline():
             
         # ลบไฟล์ซ้ำ
         soil_files_all = list(set(soil_files_all))
-        ero_files_all = list(set(ero_files_all))
         luse_files_all = list(set(luse_files_all))
+        
+        # --- [NEW] ค้นหาการชะล้างพังทลายด้วย Bounding Box ---
+        print("[Spatial Search] กำลังค้นหาไฟล์ 'การชะล้างพังทลาย' จากพิกัด Bounding Box...")
+        try:
+            import pyogrio
+            from pyproj import CRS, Transformer
+            road_bounds = engine.road_gdf.geometry.buffer(buffer_m).total_bounds # (minx, miny, maxx, maxy) EPSG:32647
+            all_ero_files = glob.glob(os.path.join(BASE_DIR, "ข้อมูลShp", "08_การชะล้างพังทลายของดิน_2563", "**", "*.shp"), recursive=True)
+            
+            road_crs = engine.road_gdf.crs
+            for f in all_ero_files:
+                try:
+                    info = pyogrio.read_info(f)
+                    shp_bounds = info['total_bounds']
+                    shp_crs = info.get('crs', None)
+                    
+                    chk_minx, chk_miny, chk_maxx, chk_maxy = road_bounds
+                    if shp_crs and CRS.from_user_input(shp_crs) != CRS.from_user_input(road_crs):
+                        transformer = Transformer.from_crs(road_crs, shp_crs, always_xy=True)
+                        p1x, p1y = transformer.transform(road_bounds[0], road_bounds[1])
+                        p2x, p2y = transformer.transform(road_bounds[2], road_bounds[3])
+                        chk_minx, chk_maxx = min(p1x, p2x), max(p1x, p2x)
+                        chk_miny, chk_maxy = min(p1y, p2y), max(p1y, p2y)
+                        
+                    if not (chk_maxx < shp_bounds[0] or chk_minx > shp_bounds[2] or chk_maxy < shp_bounds[1] or chk_miny > shp_bounds[3]):
+                        ero_files_all.append(f)
+                except Exception:
+                    pass
+        except Exception as e:
+            print(f"Error in spatial search for erosion files: {e}")
+            
+        ero_files_all = list(set(ero_files_all))
         
         if soil_files_all:
             shapefiles_to_process.append({"path": soil_files_all, "name_col": "SOIL_SERIE", "do_clip": True, "excel_name": "ชุดดิน", "sheet": {"EAR": "7.ชุดดิน", "EC": "7.ชุดดิน"}})

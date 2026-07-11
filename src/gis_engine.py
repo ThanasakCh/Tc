@@ -57,33 +57,10 @@ class GISEngine:
             self.road_gdf = gdf.to_crs(TARGET_CRS)
             return self.road_gdf
             
-        # 2. ถ้าไม่มีไฟล์ _CL.shp ให้ดึงจากฐานข้อมูลรวมประเทศ
+        # 2. ถ้าไม่มีไฟล์ _CL.shp ให้หยุดทำงานทันทีเพื่อป้องกันการโหลดถนนทั้งประเทศจนเครื่องค้าง
         project_name = os.path.basename(project_path)
-        road_path = os.path.join(self.shp_dir, "เส้นกลางถนน", "เส้นกลางถนน.shp")
-        print(f"Loading NATIONAL road centerline from {road_path}")
-        gdf = gpd.read_file(road_path)
-        
-        # --- FUZZY MATCH LOGIC ---
-        # สกัดตัวเลขสำคัญจากชื่อโปรเจกต์ เช่น "ป.84-1_สทล.1_มส._1 EAR" -> ดึง "84" หรือ "1" ออกมา
-        import re
-        numbers_in_project = re.findall(r'\d+', project_name)
-        
-        if numbers_in_project:
-            # ค้นหา route ที่ตรงกับตัวเลขในชื่อโปรเจกต์ (อย่างง่าย)
-            route_str = str(numbers_in_project[0]) 
-            print(f"Fuzzy matching route containing: {route_str}")
-            # กรอง route หรือ name ที่มีตัวเลขนั้นอยู่
-            filtered_gdf = gdf[
-                gdf['route'].astype(str).str.contains(route_str, na=False) |
-                gdf['name'].astype(str).str.contains(route_str, na=False) |
-                gdf['control'].astype(str).str.contains(route_str, na=False)
-            ]
-            if not filtered_gdf.empty:
-                gdf = filtered_gdf
-                print(f"Matched {len(gdf)} road segments for project {project_name}.")
-            else:
-                print(f"Warning: Fuzzy match failed to find route {route_str}. Using whole network (Slow!).")
-        
+        raise ValueError(f"\n[ERROR] ไม่พบไฟล์แนวเส้นทาง (_CL.shp) ในโฟลเดอร์ {project_name}\nกรุณาตรวจสอบและนำไฟล์ _CL.shp มาใส่ให้ครบถ้วนเพื่อป้องกันไม่ให้โปรแกรมทำงานหนักและเครื่องค้าง!")
+
         # แปลงพิกัดเป็น UTM 47N (EPSG:32647)
         self.road_gdf = gdf.to_crs(TARGET_CRS)
         return self.road_gdf

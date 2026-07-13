@@ -388,6 +388,13 @@ class ExcelReporter:
         if not records:
             return
 
+        # บังคับเขียนหัวตารางในแถว 2 ป้องกันเทมเพลตต้นฉบับแหว่ง
+        if is_ear:
+            self._set_cell_value_only(sht, "E2", "ระยะทาง (กม.)")
+            self._set_cell_value_only(sht, "F2", "กม. ที่ตัดผ่าน")
+        else:
+            self._set_cell_value_only(sht, "E2", "กม. ที่ตัดผ่าน")
+
         grouped = {}
         for r in records:
             a_name = str(r.get('area_name', 'ไม่ระบุ'))
@@ -521,9 +528,9 @@ class ExcelReporter:
                 props = r.get('properties', {})
                 grouped[a_name] = {
                     'moo': props.get('VILL_NO', '01'),
-                    'tambon': props.get('TAMBOL_TH', props.get('TAMBON', '')),
-                    'amphoe': props.get('AMPHOE_TH', props.get('AMPHOE', '')),
-                    'province': props.get('PROV_TH', props.get('PROVINCE', ''))
+                    'tambon': props.get('TAMBOL_T', props.get('TAMBOL_TH', props.get('TAMBON', props.get('TAMBOL', '')))),
+                    'amphoe': props.get('AMPHOE_T', props.get('AMPHOE_TH', props.get('AMPHOE', ''))),
+                    'province': props.get('PROV_NAM_T', props.get('PROV_TH', props.get('PROVINCE', props.get('CHANGWAT', ''))))
                 }
 
         # แทรกแถวเพิ่มหากข้อมูลมากกว่า 48 หมู่บ้าน (แถว 3-50)
@@ -542,12 +549,19 @@ class ExcelReporter:
             self._set_cell_value_only(sht, f"C{row}", a_name)
             
             tb = data['tambon']
+            if tb and not tb.startswith('ตำบล'): tb = f"ตำบล{tb}"
+            
+            amp = data['amphoe']
+            if amp and not amp.startswith('อำเภอ'): amp = f"อำเภอ{amp}"
+            
+            prov = data['province']
+            if prov and not prov.startswith('จังหวัด'): prov = f"จังหวัด{prov}"
+            
             admin_str = f"อบต.{tb}" if tb else ""
             self._set_cell_value_only(sht, f"D{row}", admin_str)
-            
             self._set_cell_value_only(sht, f"E{row}", tb)
-            self._set_cell_value_only(sht, f"F{row}", data['amphoe'])
-            self._set_cell_value_only(sht, f"G{row}", data['province'])
+            self._set_cell_value_only(sht, f"F{row}", amp)
+            self._set_cell_value_only(sht, f"G{row}", prov)
             
             for col in ['A', 'B', 'C', 'D', 'E', 'F', 'G']:
                 try:

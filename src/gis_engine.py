@@ -360,7 +360,9 @@ class GISEngine:
                     try:
                         admin_gdf = gpd.read_file(admin_shp).to_crs(TARGET_CRS)
                         admin_gdf = admin_gdf[admin_gdf.is_valid & ~admin_gdf.is_empty]
-                        intersected_admin = admin_gdf[admin_gdf.intersects(road_union)]
+                        # 3.2 หาตำบลที่บัฟเฟอร์ถนนผ่าน
+                        # เพื่อหาว่ามีตำบลไหนบ้างที่บัฟเฟอร์ผ่าน แต่ไม่มีหมู่บ้านในรัศมีเลย
+                        intersected_admin = admin_gdf[admin_gdf.intersects(road_buf_union)]
                         crossed_tambols = set(intersected_admin['TAMBOL_TH'].dropna())
                         
                         covered_tambols = set()
@@ -384,6 +386,24 @@ class GISEngine:
                                     (poly_gdf[tambol_col] == tb_name) | 
                                     (poly_gdf[tambol_col] == f"ตำบล{tb_name}")
                                 ]
+                                
+                                if tb_villages.empty:
+                                    print(f"  [Info] กำลังค้นหาหมู่บ้านจากฐานข้อมูลเต็มสำหรับตำบลที่ขาดหาย...")
+                                    try:
+                                        full_poly_gdf = gpd.read_file(polygon_shp_path)
+                                    except Exception as ex:
+                                        print(f"  [Error] Failed to load full shapefile: {ex}")
+                                        
+                                    if 'full_poly_gdf' in locals() and not full_poly_gdf.empty:
+                                        if TARGET_CRS:
+                                            full_poly_gdf = full_poly_gdf.to_crs(TARGET_CRS)
+                                        tambol_col_full = 'TAMBOL_T' if 'TAMBOL_T' in full_poly_gdf.columns else ('TAMBOL_TH' if 'TAMBOL_TH' in full_poly_gdf.columns else ('TAMBOL' if 'TAMBOL' in full_poly_gdf.columns else None))
+                                        if tambol_col_full:
+                                            tb_villages = full_poly_gdf[
+                                                (full_poly_gdf[tambol_col_full] == tb) | 
+                                                (full_poly_gdf[tambol_col_full] == tb_name) | 
+                                                (full_poly_gdf[tambol_col_full] == f"ตำบล{tb_name}")
+                                            ]
                                 
                                 if not tb_villages.empty:
                                     distances = tb_villages.geometry.distance(road_union)

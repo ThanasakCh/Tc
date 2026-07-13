@@ -215,7 +215,7 @@ def run_pipeline():
             {"path": os.path.join(BASE_DIR, "ข้อมูลShp", "Forest Area 2565", "forestarea2565_wgs1984.shp"), "name_col": "f_code", "do_clip": False, "buffer_m_override": 30, "sheet": {"EAR": "4.พื้นที่คงสภาพป่า_เขตทาง", "EC": None}},
             {"path": os.path.join(BASE_DIR, "ข้อมูลShp", "ชั้นคุณภาพลุ่มน้ำ", "WSC_Edit_3112025.shp"), "name_col": "wsc_ver", "do_clip": True, "excel_name": "ชั้นคุณภาพลุ่มน้ำ", "sheet": {"EAR": "10.ชั้นคุณภาพลุ่มน้ำ", "EC": "12.ชั้นคุณภาพลุ่มน้ำ"}},
             {"path": os.path.join(BASE_DIR, "ข้อมูลShp", "แม่น้ำ", "Stream.shp"), "name_col": "HY_LNAME", "do_clip": True, "sheet": {"EAR": "5.จุดตัดแหล่งน้ำ", "EC": "9.จุดตัดแหล่งน้ำ"}},
-            {"path": os.path.join(BASE_DIR, "ข้อมูลShp", "หมู่บ้าน", "ตำแหน่งหมู่บ้าน.shp"), "name_col": "VILL_NM_T", "do_clip": True, "excel_name": "บ้าน", "sheet": {"EAR": "2.พื้นที่หมู่บ้าน", "EC": "2.พื้นที่หมู่บ้าน"}},
+            {"path": os.path.join(BASE_DIR, "ข้อมูลShp", "หมู่บ้าน", "ตำแหน่งหมู่บ้าน.shp"), "name_col": "MUBAN", "do_clip": True, "excel_name": "บ้าน", "sheet": {"EAR": "2.พื้นที่หมู่บ้าน", "EC": "2.พื้นที่หมู่บ้าน"}},
             {"path": os.path.join(BASE_DIR, "ข้อมูลShp", "04_ตำแหน่งโบราณสถาน", "โบราณสถานประเทศไทย", "historic_site_export.shp"), "name_col": "HISNAME", "do_clip": True, "excel_name": "โบราณสถาน", "sheet": {"EAR": "9.แหล่งโบราณสถาน", "EC": "5.แหล่งโบราณสถาน"}},
         ]
         

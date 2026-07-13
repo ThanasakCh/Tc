@@ -427,8 +427,8 @@ def run_pipeline():
                 
                 # 5. ระบบ Cache (STEP 5)
                 if not df.empty:
-                    df['KM In'] = df['km_in_m'].apply(engine.format_km)
-                    df['KM Out'] = df['km_out_m'].apply(engine.format_km)
+                    df['KM In'] = df.apply(lambda r: "-" if r['km_in_m'] == 0 and r['km_out_m'] == 0 and r.get('length_m', 0) == 0 else engine.format_km(r['km_in_m']), axis=1)
+                    df['KM Out'] = df.apply(lambda r: "-" if r['km_in_m'] == 0 and r['km_out_m'] == 0 and r.get('length_m', 0) == 0 else engine.format_km(r['km_out_m']), axis=1)
                     
                     cache_dir = os.path.join(project_path, "cache")
                     os.makedirs(cache_dir, exist_ok=True)

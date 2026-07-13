@@ -243,13 +243,23 @@ class ExcelReporter:
                 
             if a_name not in grouped:
                 grouped[a_name] = {'kms': [], 'length_km': 0, 'area_sqm': 0}
-            km_str = f"{r['KM In']} - {r['KM Out']}"
-            grouped[a_name]['kms'].append(km_str)
+            
+            km_in = str(r.get('KM In', ''))
+            km_out = str(r.get('KM Out', ''))
+            l_m = r.get('length_m', 0)
+            if km_in != '-' and km_out != '-' and l_m > 0:
+                km_str = f"{km_in} - {km_out}"
+                if km_str not in grouped[a_name]['kms']:
+                    grouped[a_name]['kms'].append(km_str)
+            
             grouped[a_name]['length_km'] += r.get('length_m', 0) / 1000
             grouped[a_name]['area_sqm'] += r.get('intersect_area_sqm', 0)
             
         row = 3
         for a_name, data in grouped.items():
+            if data['length_km'] <= 0:
+                continue
+                
             area_sqm = data['area_sqm']
             area_sqkm = area_sqm / 1_000_000 if area_sqm else 0
             area_rai = area_sqm / 1600 if area_sqm else 0
@@ -272,7 +282,11 @@ class ExcelReporter:
                     rn = f"{rn} Zone {nrf_zone2}"
                 
                 if rn == a_name:
-                    dist_list.append(f"{r2.get('length_m', 0)/1000:.3f}")
+                    km_in2 = str(r2.get('KM In', ''))
+                    km_out2 = str(r2.get('KM Out', ''))
+                    l = r2.get('length_m', 0) / 1000
+                    if km_in2 != '-' and km_out2 != '-' and l > 0:
+                        dist_list.append(f"{l:.3f}")
             self._set_cell_value_only(sht, f"{cols['d']}{row}", "\n".join(dist_list))
             
             for c_letter in cols.values():
@@ -383,10 +397,15 @@ class ExcelReporter:
                 grouped[a_name] = {'kms': [], 'area_sqm': 0, 'length_km': 0.0}
                 
             if is_ear:
-                km_str = f"{r.get('KM In', '')}, {r.get('KM Out', '')}".strip(', ')
+                km_in = str(r.get('KM In', '')).strip()
+                km_out = str(r.get('KM Out', '')).strip()
+                if km_in != '-' and km_out != '-':
+                    km_str = f"{km_in}, {km_out}".strip(', ')
+                else:
+                    km_str = ""
             else:
-                km_in = r.get('KM In', '').strip()
-                km_str = f"กม.ที่ {km_in}" if km_in else ""
+                km_in = str(r.get('KM In', '')).strip()
+                km_str = f"กม.ที่ {km_in}" if km_in and km_in != '-' else ""
                 
             if km_str and km_str not in grouped[a_name]['kms']:
                 grouped[a_name]['kms'].append(km_str)
@@ -400,7 +419,12 @@ class ExcelReporter:
         
         rows_to_delete = []
 
-        for row in range(3, 20):
+        start_row = 3
+        end_row = 20
+        if total_row:
+            end_row = total_row - 1
+
+        for row in range(start_row, end_row + 1):
             if row == total_row:
                 continue
             val_a = sht.range(f"A{row}").value
@@ -408,15 +432,37 @@ class ExcelReporter:
                 continue
             cell_str = str(val_a).strip()
 
-            matched_class = None
+            matched_keys = []
+            cell_class = cell_str.replace("ชั้นคุณภาพลุ่มน้ำ", "").strip()
+            
             for g_class in grouped.keys():
-                if g_class.lower() in cell_str.lower():
-                    matched_class = g_class
-                    break
+                if g_class.lower() == cell_class.lower() or g_class.lower() in cell_str.lower():
+                    if g_class not in matched_keys:
+                        matched_keys.append(g_class)
+                    continue
+                
+                if cell_class in ['1A', '1B']:
+                    if g_class.upper().startswith(cell_class):
+                        if g_class not in matched_keys:
+                            matched_keys.append(g_class)
+                else:
+                    import re
+                    g_base = re.sub(r'[A-Za-z]+$', '', g_class).strip()
+                    if g_base == cell_class:
+                        if g_class not in matched_keys:
+                            matched_keys.append(g_class)
 
-            if matched_class:
-                data = grouped[matched_class]
-                area_sqm = data['area_sqm']
+            if matched_keys:
+                combined_area_sqm = sum(grouped[k]['area_sqm'] for k in matched_keys)
+                combined_length_km = sum(grouped[k]['length_km'] for k in matched_keys)
+                
+                combined_kms = []
+                for k in matched_keys:
+                    for km in grouped[k]['kms']:
+                        if km not in combined_kms:
+                            combined_kms.append(km)
+                            
+                area_sqm = combined_area_sqm
                 area_sqkm = area_sqm / 1_000_000
                 area_rai = area_sqm / 1600
 
@@ -425,15 +471,15 @@ class ExcelReporter:
                 self._set_cell_value_only(sht, f"D{row}", round(area_rai, 6))
                 
                 if is_ear:
-                    self._set_cell_value_only(sht, f"E{row}", "") # leave blank or calculate percentage
-                    self._set_cell_value_only(sht, f"F{row}", "\n".join(data['kms']))
+                    self._set_cell_value_only(sht, f"E{row}", round(combined_length_km, 3))
+                    self._set_cell_value_only(sht, f"F{row}", "\n".join(combined_kms))
                 else:
-                    self._set_cell_value_only(sht, f"E{row}", "\n".join(data['kms']))
+                    self._set_cell_value_only(sht, f"E{row}", "\n".join(combined_kms))
 
                 total_sqkm += area_sqkm
                 total_sqm += area_sqm
                 total_rai += area_rai
-                total_length_km += data['length_km']
+                total_length_km += combined_length_km
             else:
                 if is_ear:
                     rows_to_delete.append(row)
@@ -952,10 +998,14 @@ class ExcelReporter:
 
         row = 3
         for r in records:
+            km_in = str(r.get('KM In', '')).strip()
+            if km_in == '-':
+                continue
+                
             a_name = str(r.get('area_name', ''))
             if a_name in ('None', 'nan', ''):
                 a_name = 'แหล่งน้ำไม่ทราบชื่อ'
-            km_val = f"{r.get('KM In', '')}" if r.get('KM In', '') else ''
+            km_val = km_in if km_in else ''
             
             self._set_cell_value_only(sht, f'A{row}', a_name)
             self._set_cell_value_only(sht, f'B{row}', km_val)
@@ -1441,8 +1491,18 @@ class ExcelReporter:
             except Exception:
                 pass
             
-        # 4. ไม่ลบแถวที่ไม่มีข้อมูล เพื่อคงโครงสร้าง 5 หมวดหลักไว้
-            
+        # 4. ลบแถวที่ไม่มีข้อมูล
+        rows_to_delete = []
+        for r in range(2, 74):
+            val_sqkm = sht.range(f"B{r}").value
+            if not val_sqkm or float(val_sqkm) <= 0:
+                rows_to_delete.append(r)
+                
+        for r in reversed(rows_to_delete):
+            try:
+                sht.range(f"{r}:{r}").delete(shift='up')
+            except Exception:
+                pass
         # หาบรรทัดรวมใหม่ (เพราะแถวเลื่อน) เพื่อขีดเส้นหรือแก้ไขในอนาคตถ้าต้องการ
         # ไม่จำเป็นต้องแก้ เพราะเขียนข้อมูลไปหมดแล้ว
 
@@ -1775,6 +1835,10 @@ class ExcelReporter:
                 sorted_names = sorted(sheet_names, key=get_sheet_num)
                 for s_name in sorted_names:
                     wb.sheets[s_name].api.Move(After=wb.sheets[-1].api)
+                
+                # บังคับให้หน้าต่างกลับมาอยู่ที่ชีทแรกเสมอ ก่อนบันทึกไฟล์
+                if len(wb.sheets) > 0:
+                    wb.sheets[0].activate()
             except Exception as e:
                 print(f"  Warning: ไม่สามารถจัดเรียงชีตได้: {e}")
 

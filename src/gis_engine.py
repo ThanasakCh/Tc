@@ -292,7 +292,183 @@ class GISEngine:
                         if fallback in cols_lower:
                             actual_name_col = cols_lower[fallback]
                             break
-        
+                
+        # กรองข้อมูลสถานศึกษาให้เหลือเฉพาะเป้าหมายหลัก
+        if 'สถานศึกษา' in polygon_shp_path:
+            valid_prefixes = ('โรงเรียน', 'ศูนย์พัฒนาเด็ก', 'มหาวิทยาลัย', 'วิทยาลัย')
+            if actual_name_col in poly_gdf.columns:
+                names = poly_gdf[actual_name_col].astype(str).str.strip()
+                mask = names.str.startswith(valid_prefixes)
+                poly_gdf = poly_gdf[mask]
+                print(f"  [Info] กรองข้อมูลสถานศึกษาเหลือเฉพาะ 4 ประเภทเป้าหมาย จำนวน {len(poly_gdf)} แห่ง")
+        # ถ้านี่เป็นชั้นข้อมูลแบบจุด ให้ทำลอจิกเฉพาะ แล้ว return เลย!
+        is_point_layer = any(kw in str(polygon_shp_path) for kw in ['ตำแหน่ง', 'หมู่บ้าน', 'historic', 'โรงพยาบาล', 'วัด', 'รพสต'])
+        if is_point_layer and not poly_gdf.empty:
+            search_buf = buffer_m if buffer_m else 1000
+            road_union = self.road_gdf.geometry.unary_union
+            road_buf_union = road_union.buffer(search_buf)
+            
+            # 1. ดึงข้อมูลหมู่บ้าน/จุด ทั้งหมดที่ตกในบัฟเฟอร์
+            valid_polys = poly_gdf[~poly_gdf.geometry.is_empty]
+            try:
+                pts_in_buf = valid_polys[valid_polys.intersects(road_buf_union)]
+            except:
+                pts_in_buf = pd.DataFrame()
+                
+            for p_idx, pt_row in pts_in_buf.iterrows():
+                poly_name = self.safe_decode(pt_row.get(actual_name_col, "Unknown"))
+                pt_geom = pt_row.geometry
+                from shapely.geometry import Point
+                pts = [pt_geom] if pt_geom.geom_type == 'Point' else (pt_geom.geoms if hasattr(pt_geom, 'geoms') else [pt_geom])
+                
+                for pt in pts:
+                    if not isinstance(pt, Point): pt = pt.centroid
+                    min_dist = float('inf')
+                    best_km = 0
+                    best_route = 'Unknown'
+                    for r_idx, road in self.road_gdf.iterrows():
+                        rl = road.geometry
+                        if rl and not rl.is_empty:
+                            d = rl.distance(pt)
+                            if d < min_dist:
+                                min_dist = d
+                                km_b = road.get('km_start', 0.0)
+                                try: km_b = float(km_b)
+                                except: km_b = 0.0
+                                if pd.isna(km_b) or km_b > 2000: km_b = 0.0
+                                best_km = (km_b * 1000) + rl.project(pt)
+                                best_route = road.get('route', 'Unknown')
+                                
+                    results.append({
+                        'route': best_route,
+                        'area_name': poly_name,
+                        'km_in_m': best_km,
+                        'km_out_m': best_km,
+                        'length_m': 0,
+                        'intersect_area_sqm': 0,
+                        'center_x': pt.x if hasattr(pt, 'x') else pt.centroid.x,
+                        'center_y': pt.y if hasattr(pt, 'y') else pt.centroid.y,
+                        'properties': {k: self.safe_decode(v) if isinstance(v, str) else str(v) for k, v in pt_row.items() if k != 'geometry'}
+                    })
+                    
+            # 2. กฎพิเศษสำหรับหมู่บ้าน: เช็คว่ามีตำบลที่ขาดหายไปไหม
+            is_village_layer = 'บ้าน' in str(polygon_shp_path) or 'village' in str(polygon_shp_path).lower()
+            if is_village_layer:
+                from config import BASE_DIR
+                admin_shp = os.path.join(BASE_DIR, "ข้อมูลShp", "ขอบเขตการปกครอง", "ขอบเขตตำบล.shp")
+                if os.path.exists(admin_shp):
+                    try:
+                        admin_gdf = gpd.read_file(admin_shp).to_crs(TARGET_CRS)
+                        admin_gdf = admin_gdf[admin_gdf.is_valid & ~admin_gdf.is_empty]
+                        intersected_admin = admin_gdf[admin_gdf.intersects(road_union)]
+                        crossed_tambols = set(intersected_admin['TAMBOL_TH'].dropna())
+                        
+                        covered_tambols = set()
+                        for r in results:
+                            t = r.get('properties', {}).get('TAMBOL_T') or r.get('properties', {}).get('TAMBOL_TH') or r.get('properties', {}).get('TAMBOL')
+                            if t:
+                                t_str = str(t)
+                                if not t_str.startswith('ตำบล'): t_str = f"ตำบล{t_str}"
+                                covered_tambols.add(t_str)
+                                
+                        missing_tambols = crossed_tambols - covered_tambols
+                        if missing_tambols:
+                            print(f"  [Info] ตำบลที่ถนนผ่านแต่ไม่มีหมู่บ้านในรัศมี {search_buf} ม.: {missing_tambols}")
+                            for tb in missing_tambols:
+                                tambol_col = 'TAMBOL_T' if 'TAMBOL_T' in poly_gdf.columns else ('TAMBOL_TH' if 'TAMBOL_TH' in poly_gdf.columns else ('TAMBOL' if 'TAMBOL' in poly_gdf.columns else None))
+                                if not tambol_col: continue
+                                
+                                tb_name = tb.replace("ตำบล", "")
+                                tb_villages = poly_gdf[
+                                    (poly_gdf[tambol_col] == tb) | 
+                                    (poly_gdf[tambol_col] == tb_name) | 
+                                    (poly_gdf[tambol_col] == f"ตำบล{tb_name}")
+                                ]
+                                
+                                if not tb_villages.empty:
+                                    distances = tb_villages.geometry.distance(road_union)
+                                    nearest_idx = distances.idxmin()
+                                    nearest_village = tb_villages.loc[nearest_idx]
+                                    pt_geom = nearest_village.geometry
+                                    from shapely.geometry import Point
+                                    pt = pt_geom.geoms[0] if hasattr(pt_geom, 'geoms') else pt_geom
+                                    if not isinstance(pt, Point): pt = pt.centroid
+                                    
+                                    poly_name = self.safe_decode(nearest_village.get(actual_name_col, "Unknown"))
+                                    
+                                    min_dist = float('inf')
+                                    best_km = 0
+                                    best_route = 'Unknown'
+                                    for r_idx, road in self.road_gdf.iterrows():
+                                        rl = road.geometry
+                                        if rl and not rl.is_empty:
+                                            d = rl.distance(pt)
+                                            if d < min_dist:
+                                                min_dist = d
+                                                km_b = road.get('km_start', 0.0)
+                                                try: km_b = float(km_b)
+                                                except: km_b = 0.0
+                                                if pd.isna(km_b) or km_b > 2000: km_b = 0.0
+                                                best_km = (km_b * 1000) + rl.project(pt)
+                                                best_route = road.get('route', 'Unknown')
+                                                
+                                    results.append({
+                                        'route': best_route,
+                                        'area_name': poly_name,
+                                        'km_in_m': best_km,
+                                        'km_out_m': best_km,
+                                        'length_m': 0,
+                                        'intersect_area_sqm': 0,
+                                        'center_x': pt.x if hasattr(pt, 'x') else pt.centroid.x,
+                                        'center_y': pt.y if hasattr(pt, 'y') else pt.centroid.y,
+                                        'properties': {k: self.safe_decode(v) if isinstance(v, str) else str(v) for k, v in nearest_village.items() if k != 'geometry'}
+                                    })
+                                    print(f"  -> ดึงหมู่บ้าน {poly_name} มาชดเชยให้ ต.{tb}")
+                    except Exception as e:
+                        print(f"  [Warning] เกิดข้อผิดพลาดในการดึงหมู่บ้านชดเชย: {e}")
+            
+            # 3. Fallback สำหรับสถานศึกษา วัด รพ.
+            if len(results) == 0 and any(kw in str(polygon_shp_path) for kw in ['สถานศึกษา', 'วัด', 'โรงพยาบาล', 'รพสต']):
+                print(f"[{time.strftime('%X')}] ไม่พบสถานที่ในระยะตัดผ่าน ทำการดึงสถานที่ที่ใกล้ที่สุด 1 แห่งแทน...", flush=True)
+                road_union_geom = self.road_gdf.geometry.union_all()
+                distances = poly_gdf.geometry.distance(road_union_geom)
+                nearest_idx = distances.idxmin()
+                nearest_poly = poly_gdf.loc[nearest_idx]
+                poly_name = self.safe_decode(nearest_poly.get(actual_name_col, "Unknown"))
+                poly_geom = nearest_poly.geometry
+                from shapely.geometry import Point
+                pt = poly_geom.geoms[0] if hasattr(poly_geom, 'geoms') else poly_geom
+                if not isinstance(pt, Point): pt = pt.centroid
+                
+                min_dist = float('inf')
+                best_km = 0
+                for r_idx, road in self.road_gdf.iterrows():
+                    rl = road.geometry
+                    if rl and not rl.is_empty:
+                        d = rl.distance(pt)
+                        if d < min_dist:
+                            min_dist = d
+                            km_b = road.get('km_start', 0.0)
+                            try: km_b = float(km_b)
+                            except: km_b = 0.0
+                            if pd.isna(km_b) or km_b > 2000: km_b = 0.0
+                            best_km = (km_b * 1000) + rl.project(pt)
+                            best_route = road.get('route', 'Unknown')
+                
+                results.append({
+                    'route': best_route,
+                    'area_name': poly_name + " (อยู่นอกระยะบัฟเฟอร์)",
+                    'km_in_m': best_km,
+                    'km_out_m': best_km,
+                    'length_m': 0,
+                    'intersect_area_sqm': 0,
+                    'center_x': pt.x if hasattr(pt, 'x') else pt.centroid.x,
+                    'center_y': pt.y if hasattr(pt, 'y') else pt.centroid.y,
+                    'properties': {k: self.safe_decode(v) if isinstance(v, str) else str(v) for k, v in nearest_poly.items() if k != 'geometry'}
+                })
+
+            return pd.DataFrame(results)
+
         # วนลูปตามเส้นถนน (เผื่อมีหลายเส้น)
         for idx, road in self.road_gdf.iterrows():
             road_line = road.geometry
@@ -367,6 +543,28 @@ class GISEngine:
                 intersection = road_line.intersection(poly_geom)
                 
                 if intersection.is_empty:
+                    if not poly_geom.intersects(road_buf_union):
+                        continue
+                        
+                    area_sqm = 0
+                    if poly_geom.geom_type in ['Polygon', 'MultiPolygon']:
+                        area_sqm = poly_geom.intersection(road_buf_union).area
+                        
+                    if area_sqm > 0:
+                        poly_unique_id = poly.get('ID', poly.get('objectid', poly.get('FID', p_idx)))
+                        if poly_unique_id not in assigned_poly_ids:
+                            assigned_poly_ids.add(poly_unique_id)
+                            results.append({
+                                'route': road.get('route', 'Unknown'),
+                                'area_name': poly_name,
+                                'km_in_m': 0,
+                                'km_out_m': 0,
+                                'length_m': 0,
+                                'intersect_area_sqm': area_sqm,
+                                'center_x': 0,
+                                'center_y': 0,
+                                'properties': {k: self.safe_decode(v) if isinstance(v, str) else str(v) for k, v in poly.items() if k != 'geometry'}
+                            })
                     continue
                     
                 # คำนวณระยะทางและพื้นที่ตัดจริงกับบัฟเฟอร์ถนนทั้งหมดครั้งเดียว (ถ้าเป็น Polygon)
@@ -436,110 +634,6 @@ class GISEngine:
                         'center_y': mid_pt.y,
                         'properties': {k: self.safe_decode(v) if isinstance(v, str) else str(v) for k, v in poly.items() if k != 'geometry'}
                     })
-                    
-        # กฎพิเศษ: ถ้าเป็นชั้นข้อมูลหมู่บ้าน ต้องมีหมู่บ้านครอบคลุมทุกตำบลที่ถนนตัดผ่าน
-        is_village_layer = 'บ้าน' in first_path or 'village' in first_path.lower()
-        if is_village_layer:
-            from config import BASE_DIR
-            admin_shp = os.path.join(BASE_DIR, "ข้อมูลShp", "ขอบเขตการปกครอง", "ขอบเขตตำบล.shp")
-            if os.path.exists(admin_shp) and not self.road_gdf.empty:
-                try:
-                    admin_gdf = gpd.read_file(admin_shp).to_crs(TARGET_CRS)
-                    admin_gdf = admin_gdf[admin_gdf.is_valid & ~admin_gdf.is_empty]
-                    road_union = self.road_gdf.geometry.unary_union
-                    intersected_admin = admin_gdf[admin_gdf.intersects(road_union)]
-                    crossed_tambol_names = set(intersected_admin['TAMBOL_TH'].dropna())
-                    
-                    covered_tambols = set()
-                    for r in results:
-                        t = r.get('properties', {}).get('TAMBOL_TH')
-                        if t:
-                            covered_tambols.add(t)
-                            
-                    missing_tambols = crossed_tambol_names - covered_tambols
-                    if missing_tambols:
-                        print(f"  [Info] ตำบลที่ถนนผ่านแต่ไม่มีหมู่บ้านในรัศมี {buffer_m} ม.: {missing_tambols}")
-                        for tb in missing_tambols:
-                            if 'TAMBOL_TH' not in poly_gdf.columns:
-                                continue
-                            tb_villages = poly_gdf[poly_gdf['TAMBOL_TH'] == tb]
-                            if not tb_villages.empty:
-                                distances = tb_villages.geometry.distance(road_union)
-                                nearest_idx = distances.idxmin()
-                                nearest_village = tb_villages.loc[nearest_idx]
-                                
-                                pt = nearest_village.geometry
-                                min_dist_to_road = float('inf')
-                                best_km = 0
-                                best_route = 'Unknown'
-                                
-                                for r_idx, road in self.road_gdf.iterrows():
-                                    rl = road.geometry
-                                    if rl and not rl.is_empty:
-                                        d = rl.distance(pt)
-                                        if d < min_dist_to_road:
-                                            min_dist_to_road = d
-                                            km_base = road.get('km_start', 0.0)
-                                            try: km_base = float(km_base)
-                                            except: km_base = 0.0
-                                            if pd.isna(km_base): km_base = 0.0
-                                            if km_base > 2000: km_base = 0.0
-                                            best_km = (km_base * 1000) + rl.project(pt)
-                                            best_route = road.get('route', 'Unknown')
-                                            
-                                poly_name = self.safe_decode(nearest_village.get(actual_name_col, "Unknown"))
-                                results.append({
-                                    'route': best_route,
-                                    'area_name': poly_name,
-                                    'km_in_m': best_km,
-                                    'km_out_m': best_km,
-                                    'length_m': 0,
-                                    'intersect_area_sqm': 0,
-                                    'center_x': pt.x if hasattr(pt, 'x') else pt.centroid.x,
-                                    'center_y': pt.y if hasattr(pt, 'y') else pt.centroid.y,
-                                    'properties': {k: self.safe_decode(v) if isinstance(v, str) else str(v) for k, v in nearest_village.items() if k != 'geometry'}
-                                })
-                                print(f"  -> ดึงหมู่บ้าน {poly_name} (อ.{nearest_village.get('AMPHOE_TH','')} จ.{nearest_village.get('PROV_TH','')}) มาชดเชยให้ ต.{tb}")
-                except Exception as e:
-                    print(f"  [Warning] เกิดข้อผิดพลาดในการตรวจสอบหมู่บ้านตามขอบเขตตำบล: {e}")
-
-        # --- Fallback: หากไม่พบจุดตัดในรัศมี 500ม. ให้ดึงจุดที่ใกล้ที่สุด 1 จุด (เฉพาะสถานศึกษา วัด รพ.)
-        if len(results) == 0 and poly_gdf is not None and not poly_gdf.empty:
-            if 'สถานศึกษา' in polygon_shp_path or 'วัด' in polygon_shp_path or 'โรงพยาบาล' in polygon_shp_path or 'รพสต' in polygon_shp_path:
-                print(f"[{time.strftime('%X')}] ไม่พบสถานที่ในระยะตัดผ่าน ทำการดึงสถานที่ที่ใกล้ที่สุด 1 แห่งแทน...", flush=True)
-                
-                # หาจุดที่ใกล้ที่สุดจาก road_buf_union
-                road_union_geom = self.road_gdf.geometry.union_all()
-                distances = poly_gdf.geometry.distance(road_union_geom)
-                nearest_idx = distances.idxmin()
-                nearest_poly = poly_gdf.loc[nearest_idx]
-                
-                poly_name = self.safe_decode(nearest_poly.get(actual_name_col, "Unknown"))
-                poly_geom = nearest_poly.geometry
-                
-                from shapely.geometry import Point
-                pt = poly_geom.geoms[0] if hasattr(poly_geom, 'geoms') else poly_geom
-                if not isinstance(pt, Point):
-                    pt = pt.centroid
-                
-                # หา km อ้างอิงจากเส้นถนน
-                road_line = self.road_gdf.geometry.iloc[0]
-                km_start_base = self.road_gdf.iloc[0].get('km_start', 0)
-                dist_on_line = road_line.project(pt)
-                km = (km_start_base * 1000) + dist_on_line
-                
-                results.append({
-                    'route': self.road_gdf.iloc[0].get('route', 'Unknown'),
-                    'area_name': poly_name + " (อยู่นอกระยะ 500ม.)",
-                    'km_in_m': km,
-                    'km_out_m': km,
-                    'length_m': 0,
-                    'intersect_area_sqm': 0,
-                    'center_x': pt.x,
-                    'center_y': pt.y,
-                    'properties': {k: self.safe_decode(v) if isinstance(v, str) else str(v) for k, v in nearest_poly.items() if k != 'geometry'}
-                })
-
         return pd.DataFrame(results)
 
     def clip_and_save_shapefile(self, shp_path, buffer_m, output_path, excel_path=None, do_clip=True):
